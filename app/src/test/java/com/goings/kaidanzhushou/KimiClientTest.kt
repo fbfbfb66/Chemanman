@@ -1,0 +1,105 @@
+package com.goings.kaidanzhushou
+
+import com.goings.kaidanzhushou.data.remote.KimiClient
+import com.goings.kaidanzhushou.data.remote.KimiErrorKind
+import com.goings.kaidanzhushou.data.remote.KimiException
+import com.goings.kaidanzhushou.data.remote.SseContentParser
+import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
+import okhttp3.OkHttpClient
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.SocketPolicy
+import okio.Buffer
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.io.File
+
+class KimiClientTest {
+    private val payload = """{"destination_text":"杭州","delivery_type":"delivery","sender_name":"张三","receiver_name":"李四","receiver_mobile":null,"goods_name":"配件","package":null,"quantity":2,"weight":12.5,"volume":null,"freight":8,"uncertain_fields":["receiver_mobile"],"notes":null}"""
+
+    @Test fun parsesMultiChunkSse() {
+        val first = payload.substring(0, 80)
+        val second = payload.substring(80)
+        val json = Json
+        val sse = "data: {\"choices\":[{\"delta\":{\"content\":${json.encodeToString(first)}}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"content\":${json.encodeToString(second)}}}]}\n\n" + "data: [DONE]\n\n"
+        assertEquals(payload, SseContentParser().parse(Buffer().writeUtf8(sse)))
+    }
+
+    @Test fun mockServerStreamsStructuredDraft() {
+        runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val chunk = "data: {\"choices\":[{\"delta\":{\"content\":${Json.encodeToString(payload)}}}]}\n\ndata: [DONE]\n\n"
+            server.enqueue(MockResponse().setResponseCode(200).setHeader("Content-Type", "text/event-stream").setBody(chunk))
+            val file = File.createTempFile("waybill", ".jpg").apply { writeBytes(byteArrayOf(1, 2, 3)) }
+            val client = KimiClient(OkHttpClient(), baseUrl = server.url("/v1/").toString())
+            val result = client.recognize("test-key", file)
+            assertEquals("杭州", result.destination_text)
+            assertEquals(2, result.quantity)
+            val request = server.takeRequest()
+            assertEquals("Bearer test-key", request.getHeader("Authorization"))
+            assertTrue(request.body.readUtf8().contains("kimi-k3"))
+            file.delete()
+        } finally { server.shutdown() }
+        }
+    }
+
+    @Test fun missingFieldsAreRejected() {
+        val client = KimiClient(OkHttpClient(), baseUrl = "http://localhost/")
+        val error = runCatching { client.parseDraft("{\"destination_text\":\"杭州\"}") }.exceptionOrNull() as KimiException
+        assertEquals(KimiErrorKind.INVALID_RESPONSE, error.kind)
+    }
+
+    @Test fun rateLimitCarriesRetryAfter() {
+        runBlocking {
+        val server = MockWebServer(); server.start()
+        try {
+            server.enqueue(MockResponse().setResponseCode(429).setHeader("Retry-After", "2").setBody("{}"))
+            val file = File.createTempFile("waybill", ".jpg")
+            val client = KimiClient(OkHttpClient(), baseUrl = server.url("/").toString())
+            val error = runCatching { client.recognize("test", file) }.exceptionOrNull() as KimiException
+            assertEquals(KimiErrorKind.RATE_LIMIT, error.kind)
+            assertEquals(2000L, error.retryAfterMillis)
+            file.delete()
+        } finally { server.shutdown() }
+        }
+    }
+
+    @Test fun classifiesPermanentQuotaServerAndNetworkFailures() {
+        listOf(
+            MockResponse().setResponseCode(401) to KimiErrorKind.UNAUTHORIZED,
+            MockResponse().setResponseCode(402) to KimiErrorKind.QUOTA,
+            MockResponse().setResponseCode(400).setBody("quota exceeded") to KimiErrorKind.QUOTA,
+            MockResponse().setResponseCode(503) to KimiErrorKind.SERVER,
+            MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START) to KimiErrorKind.NETWORK,
+        ).forEach { (response, expected) ->
+            val server = MockWebServer(); server.start()
+            try {
+                server.enqueue(response)
+                val file = File.createTempFile("waybill", ".jpg")
+                val client = KimiClient(OkHttpClient(), baseUrl = server.url("/").toString())
+                val error = runBlocking { runCatching { client.recognize("test", file) }.exceptionOrNull() } as KimiException
+                assertEquals(expected, error.kind)
+                file.delete()
+            } finally { server.shutdown() }
+        }
+    }
+
+    @Test fun malformedJsonStreamIsRejected() {
+        val server = MockWebServer(); server.start()
+        try {
+            val sse = "data: {\"choices\":[{\"delta\":{\"content\":\"not-json\"}}]}\n\ndata: [DONE]\n\n"
+            server.enqueue(MockResponse().setResponseCode(200).setBody(sse))
+            val file = File.createTempFile("waybill", ".jpg")
+            val error = runBlocking {
+                runCatching { KimiClient(OkHttpClient(), baseUrl = server.url("/").toString()).recognize("test", file) }.exceptionOrNull()
+            } as KimiException
+            assertEquals(KimiErrorKind.INVALID_RESPONSE, error.kind)
+            file.delete()
+        } finally { server.shutdown() }
+    }
+}

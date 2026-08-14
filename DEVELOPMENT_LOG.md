@@ -28,6 +28,10 @@
 | `TASK-20260814-010` | 2026-08-14 | 保留新运单自动打开的到站菜单并分阶段打开其他菜单 | 离线与浏览器模拟通过 | `v1.0.12` |
 | `TASK-20260814-011` | 2026-08-14 | 已活动的新运单页签零点击切换并记录焦点状态 | 离线与浏览器模拟通过 | `v1.0.13` |
 | `TASK-20260814-012` | 2026-08-14 | 正式串行流程最终实站验收与故障链路归档 | 6/6 保存、72/72 字段通过 | `v1.0.13` |
+| `TASK-20260814-013` | 2026-08-14 | 界面重做为应用式面板并迁移交付目录（引擎零改动） | 离线与浏览器模拟通过，实站已回归 | `v1.1.0` |
+| `TASK-20260814-014` | 2026-08-14 | 鲁棒性加固：断点续跑、关闭确认、慢网络超时放宽 | 离线与浏览器模拟 23/23 通过，实站已回归 | `v1.2.0` |
+| `TASK-20260814-015` | 2026-08-14 | 修正展开订单明细后窗口长出屏幕的定位问题 | 浏览器模拟 13/13 通过（含对照组），实站已回归 | `v1.2.1` |
+| `TASK-20260814-016` | 2026-08-14 | v1.2.1 实站回归验收，解除三项待验证状态 | 用户确认实站测试通过 | `v1.2.1` |
 
 ---
 
@@ -630,3 +634,182 @@ v1.0.9实站的第一单三种下拉均成功，第二单尾号069在到站步�
 - 连续四单浏览器模拟通过，任意时刻最多一个保存请求，活动页签及到站均无多余点击；
 - 连续六单真实网站验收通过，运单号 071～076 正确推进；
 - 正式脚本版本保持 v1.0.13，不因仅更新验收文档而升版。
+
+## TASK-20260814-013 界面重做为应用式面板并迁移交付目录
+
+### 0. 目标与硬约束
+
+目标：把调试风格的控制面板重做成普通用户能直接上手的应用式界面；正式交付物从 `outputs/<uuid>/` 迁到根目录 `script/`。
+
+硬约束（用户明确要求）：**绝对不影响脚本处理逻辑。** 因此本轮先做了一次边界勘定，把文件切成"界面"与"引擎"两部分，再只动界面。
+
+### 1. 变更范围
+
+界面函数整体重写：`initializeUi`、`buildPanelHtml`、`renderSummary`、`taskActions`、`actionButton`、`stateLabel`、`taskExplanation`、`setStatus`。
+
+新增 17 个界面辅助函数：`installPanelChrome`、`setWindowOpen`、`loadWindowPosition`、`applyWindowPosition`、`beginDrag`、`moveDrag`、`endDrag`、`pickFile`、`acceptDroppedFile`、`toggleDebugByTaps`、`uiConfirm`、`requestAuthorizedRun`、`taskTrouble`、`taskTone`、`plainIssue`、`plainStatus`、`renderShell`。
+
+7 处 `window.confirm` 改为应用内弹窗（每处一行，语义等价）：`abandonTask`、`confirmAmbiguousSaved`、`confirmNotSaved`、`confirmManuallyClosed`、`retryOrderCreation`、`unlockDuplicates`、`discardRecoveredBatch`。后两个原为同步函数，现改为 `async`；`unlockDuplicates` 在 `window.__CMBatchSerial` 上导出，返回值由 `undefined` 变为 `Promise<undefined>`。
+
+版本 `1.0.13` → `1.1.0`（`@version` 与 `SCRIPT_VERSION`）。`CHECKPOINT_VERSION` 保持 3，旧检查点仍可恢复。
+
+文件迁移：`油猴批量串行自动填写保存.user.js` 与使用说明迁至 `script/`，新增 `script/README.md`；历史测试脚本与测试数据留在 `outputs/019fff22-6abf-7472-96f4-a0694f6fc144/`。
+
+### 2. 界面设计要点
+
+- **悬浮球 + 可拖动窗口。** 平时右下角只有一个 56px 的球，不遮挡车满满页面；点开是 720px 宽的窗口，按标题栏可拖动，位置存在 `cm-batch-ui-pos-v1`。球上有角标：运行中显示 `已完成/总数`，需要人工时变橙色显示待处理条数。
+- **按批次阶段呈现。** 空闲 / 已导入待确认 / 导入有问题 / 运行中 / 需要人工 / 完成，同一时刻只渲染当前阶段，14 个平铺按钮收敛为每屏 1–3 个。
+- **报错一律翻译。** 新增 `TROUBLE_BY_CODE`（覆盖全部 22 个 `errorCode`）、`TROUBLE_BY_STATE`（覆盖 21 个 state）、`STAGE_TEXT`、`FIELD_LABEL`、`STATUS_RULES`、`plainIssue`。查表顺序为 errorCode → state → MANUAL_STATES 兜底 → 硬编码兜底，保证任何未知状态都不会渲染空白。原始技术文本一字不改地保留在 `task.error` / `state.importErrors` 中，照常进入导出报告，界面上折叠进调试模式。
+- **导入预检报错按列名翻译。** `第 3 行 quantity：必须为正整数` → `第 3 行「件数」：要填大于 0 的整数`；公式单元格列表里的英文列名也一并替换。
+- **授权勾选框改为确认弹窗。** `#authorize` 复选框仍在 DOM 中（隐藏），门禁判断 `state.authorization` 完全没动。可见的「开始处理」「继续」是代理按钮，确认后写入 `#authorize.checked` 再 `.click()` 真正的 `#start` / `#resume`。**此处曾发现一个会导致功能损坏的坑：`resumeBatch` 同样以 `state.authorization` 为门禁，而刷新后该值恒为 `false`，若只给「开始」加弹窗，「继续」将永久失效。** 因此两个入口共用 `requestAuthorizedRun`。
+- **隐藏调试开关。** 标题栏连点版本号 5 次切换，存在 `cm-batch-ui-debug-v1`。关闭时隐藏「导出诊断JSON」、技术详情、原始状态栏文案和"已挡下的意外保存"计数。以后要删除 JSON 报告，只需去掉该开关，`#diagnostic` 按钮保留在 DOM 中（`initializeUi` 无条件按 id 缓存，删除会抛错）。
+- **拖拽导入。** 拖入的文件通过 `DataTransfer` 写进隐藏的 `#file.files` 再派发 `change`，因此 `handleFileSelection` 与 `resetForNewBatch` 里的 `file.value = ""` 完全不用改。
+
+### 3. 必须保持的隐式契约（本轮记录，供后续维护）
+
+1. `initializeUi` 按 16 个 id 无条件缓存元素，任何一个缺失都会抛错 —— 不用的元素只能隐藏，不能删。
+2. 任务操作按钮必须带 `data-action` + `data-task`，`handlePanelAction` 依此分派；界面外壳按钮一律不带 `data-action`。
+3. host 元素 id 必须是 `cm-batch-serial-production-host`，引擎有 13 处用它把面板排除在 DOM 扫描外。补充结论：`document.querySelectorAll` 不穿透 open shadow root，所以真正的不变量是"界面 DOM 绝不放到影子树之外"。
+4. `resetForNewBatch` 直接写 `file.value` 与 `authorize.checked`，两者必须是真实的 input 元素。
+5. `exportReportCsv` 在批次完成时被自动调用（非用户点击），签名不能改。
+6. `sanitizeForReport` 夹在界面函数之间但属于脱敏逻辑，一行未动；界面上渲染任何原始文本都必须经过它。
+
+### 4. 验证
+
+- **函数级 diff（主证据）。** 按顶层函数切块比对改动前后：146 → 163 块，**128 个引擎函数逐字节零差异**，含全部拦截栈、`validateOrders`、`runScheduler`、`processTask`、下拉引擎、`verifyCompleteOrder`、`saveSingleTask`、`applySaveResult`、`handlePanelAction`、`persistCheckpoint`/`restoreCheckpoint`、台账、`switchToTask`、XLSX 解析、`sanitizeForReport`、三个报告函数与全部工具函数。有差异的 18 块中，3 块为切块工具把新增常量归入前一函数所致（逐行核对：0 行删除，仅新增），其余 15 块即上述界面函数与 7 处 confirm。
+- **语法检查通过**（`deno check`，退出码 0）。
+- **浏览器模拟通过。** 在本地静态页加载脚本：16 个 id 全部存在、`#filter` 四个 option 值不变、`window.__CMBatchSerial` 仍为 24 个键、`version` 为 `1.1.0`；逐一驱动 5 个阶段渲染正确；导入预检 15 类报错全部翻译且无 `ZIP`/`XML`/`errno`/英文列名泄漏；确认弹窗取消后 `state.authorization` 仍为 `false` 且 `batchStarted` 未变；调试模式开关双向生效。
+- **拖动安全性。** 合成事件（`isTrusted === false`，即引擎 `dispatchUserLikeClick` 派发的那类）被拖动处理器拒绝，窗口位置不变；真实事件路径下位移精确、越界夹取正确（8px 边距）、位置持久化正常、点击标题栏按钮不会触发拖动。
+- **尚未验证：实站回归。** 本轮没有在真实账号上执行保存。
+
+### 5. 下次注意事项
+
+1. **实站回归尚未做。** 上线前必须用 2 条虚构订单跑一次完整流程，确认：保存成功、12 字段回读通过、成功页签保留、批次完成自动导出 CSV、检查点被清除。
+2. 若离线测试中有同步调用 `__CMBatchSerial.unlockDuplicates()` 的用例，需改为 `await`。
+3. 新增任何界面元素时，遵守"`data-action` 只给任务按钮"这条约定，否则会被 `handlePanelAction` 误捕。
+4. `renderSummary` 在每次 `transitionTask` 时被调用（每单约 8 次）。当前 100 条任务的渲染为单次模板拼接，未观察到卡顿；若日后表格再变复杂，需实测后考虑 rAF 合并。
+5. 引擎侧新增 state 或 errorCode 时，记得同步补 `TROUBLE_BY_CODE` / `TROUBLE_BY_STATE` / `STAGE_TEXT`；漏补不会报错，会落到兜底文案。
+
+---
+
+## TASK-20260814-014：鲁棒性加固（断点续跑、关闭确认、慢网络超时放宽）
+
+### 1. 任务目标
+
+在不改变处理逻辑（状态机转移判定、保存门禁、拦截守卫、字段回读）的前提下提升 v1.1.0 的鲁棒性，并实现三项用户需求：浏览器/页面关闭后重开可点「继续」续跑未保存订单；运行中关闭页面弹出确认框；慢网络下放宽超时，解决"保存慢导致下一单找不到标签页"。
+
+### 2. 只读检查结论（本轮起点）
+
+通读全部 2498 行后确认：核心链路无会导致错误下单的缺陷，所有可疑路径均收敛到"停下来等人工"。剩余提升空间集中在四类：catch 内对非 Error 抛出物的属性访问会二次崩溃；检查点每次全量序列化 500 条诊断事件写 localStorage 的配额与卡顿风险；后台标签页定时器节流会拉长等待、误判超时；`baselineTabs` 强持有已分离 DOM。另有三项涉及判定边界的发现（`isOrderNumberAdvanced` 不等长数字直接放行、无 `r` 属性单元格 XLSX 解析失败、候选扫描全量 DOM 遍历），用户未批准修改，仅记录为已知边界。
+
+### 3. 实现内容（v1.2.0）
+
+**防御性加固（不改判定）：**
+
+- `processTask`/`failTask`/`fillDirectTask`/`fillCustomTask`/`verifyCompleteOrder` 的 catch 内 `error.xxx` 全部改为 `error?.xxx`。
+- `unlockDuplicates` 的 `saveLedger` 补 try；失败时报"解除防重复记录失败"并中止解锁。
+- `persistCheckpoint` 写入失败时把诊断事件裁到最近 50 条重试一次，仍失败才 globalHalt（原有行为）；成功路径不变。
+- `installSafetyGuards` 新增 `error`/`unhandledrejection` 监听，仅 `recordDiagnostic("unhandled_error")`。
+- `MinimalZip.read`/`readDirectory` 将截断文件触发的 DataView RangeError 包装为中文"不是有效的 XLSX/ZIP 文件或文件已损坏"。
+
+**环境稳健性：**
+
+- `baselineTabs` Set→WeakSet（仅 `.has()` 用法，`WeakSet.has(null)` 返回 false 与 Set 一致，零行为差异）。
+- 新增 `visibilitychange` 监听：记诊断事件；批次运行中转后台时状态栏警告保持前台。
+
+**断点续跑：** 新增 `PRE_SAVE_STATES`（creating/waiting_create_entry/direct_filling/custom_pending/custom_filling/verifying/ready_to_save/mapping_failed/manual_pending/order_number_blocked/create_entry_blocked——均从未触发保存请求）。`restoreCheckpoint` 将其映射为 `pending` 并清空单号/字段/save/errorCode，`creationAttempted` 置 `true`，使重跑首单先走既有 `resolveExistingDraft` 页签预检，网站未清理的遗留草稿会被现有安全机制拦住。`saving`/`save_ambiguous` 仍进 `save_ambiguous`；`save_failed`/`decision_required`/旧 `interrupted_manual` 仍进 `interrupted_manual`（用户确认：已点过保存的一律人工核对，防重复下单）。`resumeBatch` 门禁与授权弹窗未动。恢复横幅与状态栏文案改为"没保存过的订单已重新排队，点「继续」接着做"。
+
+**关闭确认：** 新增 `beforeunload` 监听，`state.running` 或存在未 settled 保存许可时 `preventDefault`；暂停/完成状态不拦（检查点已落盘）。
+
+**慢网络超时（提为顶部命名常量）：** 保存许可 20s→60s、请求捕获 5s→10s、performance 兜底 1.5s→3s、创建入口/结果 15s→30s、页签切换 5s→10s、重绑 8s→15s、关闭观察 4s→8s、到站候选 2.4s/4.5s→4.8s/9s、下拉候选 1.8s/3.5s→3.6s/7s、选择确认 3.5s/3s→7s/6s、保存后冷却 `POST_SAVE_COOLDOWN_MS` 3s→6s。冷却×2 直接对应用户报告的症状：TASK-004（v1.0.6）记录的保存后约 2 秒异步 DOM 刷新窗口在慢网下变长，旧 3 秒冷却不够，下一单创建期间 DOM 被替换导致绑定失败。所有超时只推迟失败判定，成功路径条件满足即返回。节奏性 sleep（100–300ms）与 500ms 稳定判定未动。
+
+版本 `1.1.0` → `1.2.0`；`CHECKPOINT_VERSION` 保持 3（快照结构未变，仅恢复映射变化，v2/v3 旧检查点仍可恢复）。
+
+### 4. 验证
+
+- `deno check` 通过；grep 确认旧超时魔数（20000/15000/8000/5000/4500/4000/3500/3000/2400/1800/1500）全部替换为常量、无遗漏。
+- 浏览器模拟（本地静态页加载脚本 + 注入 v2 检查点）23/23 通过：7 类状态恢复映射正确；重排任务字段清空且 `creationAttempted=true`；首写检查点模拟 QuotaExceededError 后以 50 条事件重试成功且 `globalHalt` 为空、v2 旧键被删除；恢复状态栏白话文案正确（含重排/人工计数）；beforeunload 空闲不拦、`running` 时拦截；unhandledrejection 进入诊断；无 EOCD 与 EOCD 越界两类损坏文件均报中文错误；`window.__CMBatchSerial` 仍为 24 键。
+- **离线测试通过，真实系统验证未做。**
+
+### 5. 下次注意事项
+
+1. **实站回归必做**：2 条虚构订单完整流程；另需专门验证断点续跑——第 1 单保存成功后、第 2 单填写中途关闭整个标签页，重开后确认第 2 单显示"排队等待"、点「继续」后先走页签预检再正常创建。
+2. 慢网验证：可用 DevTools Network 节流（Slow 3G）跑一单，确认保存等待不再 20 秒误判为结果不确定。
+3. `PRE_SAVE_STATES` 与恢复映射强耦合：引擎侧新增任何"保存前"state 时必须同步加入该集合，否则恢复后会落到 `interrupted_manual` 人工兜底（安全但体验退化）；新增"保存后"state 则绝不能加入。
+4. 检查点降级重试只影响落盘副本；内存 `state.diagnostics` 仍保留 500 条上限，导出诊断 JSON 不受影响。
+5. `baselineTabs` 已是 WeakSet，不可再对其做遍历或计数类扩展。
+6. 三项已知边界（不等长运单号比较、无 `r` 属性 XLSX、候选全量扫描）为用户明确不改项，动它们前先取得确认。
+
+---
+
+## TASK-20260814-015：展开订单明细后窗口长出屏幕
+
+### 1. 现象
+
+用户报告：展开「订单明细」折叠区后，助手窗口的位置不会自适应改变，窗口底部长到屏幕外面，每次都必须手工把窗口拖回来才能继续看。
+
+### 2. 根因
+
+`applyWindowPosition(x, y)` 的边界夹取逻辑本身是正确的（`maxY = innerHeight - height - 8`，会把窗口拉回可视区），但它只在三个时机被调用：`setWindowOpen(true)` 打开窗口、`moveDrag` 拖动过程中、`window.resize` 浏览器窗口尺寸变化。**面板自身内容高度变化时没有任何调用点。**
+
+叠加两个既有设计放大了后果：一是默认位置为 `Math.max(8, maxY - 24)`，即贴近屏幕底部；二是 `.win` 的 `max-height:86vh` 允许窗口长到接近整屏。于是展开明细时窗口只能从底部向下生长，直接越过可视区下边界。
+
+实测数据（视口 1000px、12 条订单）：折叠时窗口 `top=531 / height=437 / bottom=968` 正常；展开后高度增至 860，而 `top` 仍为 531，底边落在 **1391px，超出视口 391px**。
+
+### 3. 修正
+
+新增 `reclampWindowPosition()`，内部复用既有 `applyWindowPosition(panel.pos?.x, panel.pos?.y)`，不重复实现夹取算法。两个触发点：
+
+- `#detail` 的 `toggle` 事件 —— 直接对应用户报告的操作；
+- `renderShell()` 末尾 —— 覆盖阶段切换、人工卡片弹出、运行中表格行数变化等其他会改变高度的路径（`renderSummary` 每次 `transitionTask` 都会走到，因此运行期间的内容增长也被兜住）。
+
+两条约束：拖动过程中不干预（`panel.drag` 判空，避免与 `moveDrag` 抢位置）；自动避让**不**写入 `localStorage`（`endDrag` 才持久化），因此用户手工拖到的位置仍然是下次打开窗口时的首选，窗口变矮后不会被自动避让的坐标污染。
+
+### 4. 曾尝试并否决的方案：ResizeObserver
+
+初版用 `new ResizeObserver(reclamp).observe(el.win)`，理论上覆盖面最广（含浏览器缩放、文本换行等一切高度变化）。**但在 Browser 预览环境中该观察器一次都没有触发**：页面探针显示 `firedTotal: 0`，连 `observe()` 本应立即投递的初始回调都没有；同一时刻 `getBoundingClientRect()` 却能读到 437→860 的真实高度变化。原因是 ResizeObserver 的通知在事件循环的「更新渲染」步骤投递，而预览面板未显示时页面不合成帧。
+
+真实可见标签页中它会正常工作，但**在本环境中无法验证**。据此改用 `toggle` + `renderShell` 组合：两者都不依赖渲染帧、可被测试直接驱动，覆盖范围与实际需求一致。结论记在此处，避免后续维护者再次绕回 ResizeObserver。
+
+### 5. 验证
+
+- `deno check` 通过。
+- 浏览器模拟 13/13 通过（视口 1280×1000、12 条订单的已恢复批次）：
+  - **对照组确认 bug 真实存在** —— 断言 `topBefore + heightAfter > innerHeight`，实测旧行为会超出底边 391px；
+  - 修复后展开明细，窗口自动上移 `top 531 → 132`、`bottom=992` 完整落在视口内；
+  - 折叠后仍完整可见，未被弹走；
+  - 窗口停在上方且空间充足时展开**不移动**（`top 132 → 132`），确认只在越界时才介入；
+  - 无横向溢出；阶段/内容变化后同样完整可见；`window.__CMBatchSerial` 仍为 24 键。
+- v1.2.0 回归套件 22/23 通过，唯一 FAIL 是该套件写死的 `version === "1.2.0"` 断言过期，非行为回归。
+- **离线测试通过，真实系统验证未做。**
+
+### 6. 下次注意事项
+
+1. 实站回归与 v1.2.0 一并做；顺带在真实页面确认展开明细后窗口自动上移、且拖到别处后不会被抢位置。
+2. 若日后给面板新增会改变高度的区块，不必再加触发点 —— 走 `renderShell` 的自然会被覆盖；只有绕过 `renderSummary` 直接改 DOM 的路径才需要手动调 `reclampWindowPosition()`。
+3. `reclampWindowPosition` 刻意不持久化位置。如果以后要改成持久化，先想清楚"窗口变高被迫上移"是否应该覆盖用户手工选定的位置。
+4. 本环境（Browser 预览面板未显示时）不投递 ResizeObserver 回调、也无法截图，涉及渲染帧的特性一律无法验证，选型时避开。
+
+---
+
+## TASK-20260814-016：v1.2.1 实站回归验收
+
+### 1. 结果
+
+用户在真实车满满系统完成 v1.2.1 测试，确认**一切正常**。TASK-013 / 014 / 015 三条记录中的「待实站回归」状态就此解除。
+
+本次验收覆盖 v1.1.0 → v1.2.1 累积的全部改动：应用式面板界面重做、断点续跑、运行中关闭确认、慢网络超时放宽（保存 60s / 保存后冷却 6s / 其余 ×2）、订单明细展开后的窗口自动避让，以及 catch 可空访问、检查点写入降级重试、损坏 XLSX 中文报错等防御性加固。
+
+### 2. 记录边界（重要）
+
+本条为**用户口头确认的整体通过结论**，未回传逐条订单的字段回读数、运单号递增序列或脱敏 CSV 报告。因此：
+
+- 不得据此引用任何具体条数或通过率指标；本文件中形如「6/6 保存、72/72 字段」的精确数据只属于 TASK-012（v1.0.13）那次有报告归档的验收。
+- 若后续需要 v1.2.x 的精确实站证据（例如排查回归、对外说明稳定性），应重新跑一轮并归档导出的脱敏报告，不要引用本条。
+- 本条**不覆盖**未曾进入实站路径的分支：`errno=320` 人工继续、保存结果不确定的人工核对、台账写入失败重试、旧 v1.0.0 并行检查点阻断等，这些仍只有模拟层面的验证。
+
+### 3. 下次注意事项
+
+1. 脚本侧本轮收尾。后续若改动引擎，实站回归须重做，且建议归档脱敏 CSV，以便留下可引用的精确数据。
+2. 三项已知边界仍未处理，且用户明确不改：`isOrderNumberAdvanced` 不等长数字比较、无 `r` 属性单元格的 XLSX、`chooseNewExactOption` 全量 DOM 扫描。动它们前先取得确认。
+3. Android 端「开单助手」目前只是初步搭建（TASK 未单列），尚无实机验收记录；其识别、导出与并发策略均未经过真实设备验证。
