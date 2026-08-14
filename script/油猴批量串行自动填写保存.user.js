@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         车满满批量串行自动填写保存
 // @namespace    codex.chemanman.batch-serial.production
-// @version      1.2.1
-// @description  从本地 XLSX 严格逐条填写保存。v1.2.1 修正展开订单明细后窗口长出屏幕的定位问题，处理判定与 v1.1.0 一致。
+// @version      1.3.0
+// @description  从本地 XLSX 严格逐条填写保存。兼容 Schema v1.1 的现付、到付和回付，串行保存逻辑保持不变。
 // @author       User
 // @match        https://t800.chemanman.com/Order*
 // @run-at       document-start
@@ -12,7 +12,7 @@
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "1.2.1";
+  const SCRIPT_VERSION = "1.3.0";
   const CHECKPOINT_VERSION = 3;
   const MAX_ORDERS = 100;
   const SERIAL_CONCURRENCY = 1;
@@ -61,7 +61,7 @@
     { key: "weight", dataPath: "weight_1", kind: "number", required: false },
     { key: "volume", dataPath: "volume_1", kind: "number", required: false },
     { key: "freight", dataPath: "co_freight_f", kind: "number", required: true },
-    { key: "payment_type", dataPath: "pay_mode", kind: "choice", required: true, display: { pay_billing: "现付" } },
+    { key: "payment_type", dataPath: "pay_mode", kind: "choice", required: true, display: { pay_billing: "现付", pay_arrival: "到付", pay_receipt: "回付" } },
   ];
   const DIRECT_FIELDS = FIELD_MAPPINGS.filter((item) => item.kind === "text" || item.kind === "number");
   const CUSTOM_FIELDS = FIELD_MAPPINGS.filter((item) => item.kind === "autocomplete" || item.kind === "choice");
@@ -862,14 +862,17 @@
       const label = `第 ${row.__rowNumber || "?"} 行`; const order = { ...row }; delete order.__rowNumber; delete order.__formulaFields;
       if (row.__formulaFields?.length) errors.push(`${label}：不允许公式单元格（${row.__formulaFields.join("、")}）`);
       for (const key of REQUIRED_HEADERS) if (typeof order[key] === "string" && /^(null|undefined)$/i.test(order[key].trim())) errors.push(`${label} ${key}：不得用 ${order[key]} 表示空值`);
-      if (String(order.schema_version || "").trim() !== "v1.0") errors.push(`${label} schema_version：必须为 v1.0`);
+      const schemaVersion = String(order.schema_version || "").trim();
+      if (!["v1.0", "v1.1"].includes(schemaVersion)) errors.push(`${label} schema_version：必须为 v1.0 或 v1.1`);
       const id = String(order.source_record_id || "").trim(); const batchId = String(order.batch_id || "").trim();
       if (!id) errors.push(`${label} source_record_id：不能为空`);
       if (seen.has(id)) errors.push(`${label} source_record_id：${id} 重复`); seen.add(id);
       if (!batchId) errors.push(`${label} batch_id：不能为空`); batchIds.add(batchId);
       for (const key of ["destination_text", "sender_name", "receiver_name", "goods_name"]) if (!String(order[key] ?? "").trim()) errors.push(`${label} ${key}：不能为空`);
       if (!["delivery", "pickup"].includes(String(order.delivery_type))) errors.push(`${label} delivery_type：仅支持 delivery/pickup`);
-      if (String(order.payment_type) !== "pay_billing") errors.push(`${label} payment_type：正式 v1.0 仅支持 pay_billing`);
+      const paymentType = String(order.payment_type || "").trim();
+      if (schemaVersion === "v1.0" && paymentType !== "pay_billing") errors.push(`${label} payment_type：Schema v1.0 仅支持 pay_billing`);
+      if (schemaVersion === "v1.1" && !["pay_billing", "pay_arrival", "pay_receipt"].includes(paymentType)) errors.push(`${label} payment_type：Schema v1.1 仅支持 pay_billing/pay_arrival/pay_receipt`);
       const quantity = toNumber(order.quantity); if (!Number.isInteger(quantity) || quantity <= 0) errors.push(`${label} quantity：必须为正整数`); order.quantity = quantity;
       for (const key of ["weight", "volume"]) {
         if (isBlank(order[key])) order[key] = ""; else { const value = toNumber(order[key]); if (!Number.isFinite(value) || value < 0) errors.push(`${label} ${key}：必须为空或非负数`); order[key] = value; }
@@ -2250,8 +2253,9 @@
       [/必须为空或非负数$/, "要么留空，要么填 0 或正数"],
       [/必须为非负数且最多两位小数$/, "要填 0 或正数，最多两位小数"],
       [/仅支持 delivery\/pickup$/, "只能填 delivery（送货）或 pickup（自提）"],
-      [/正式 v1\.0 仅支持 pay_billing$/, "目前只支持 pay_billing（月结）"],
-      [/必须为 v1\.0$/, "必须写 v1.0"],
+      [/Schema v1\.0 仅支持 pay_billing$/, "v1.0 文件的付款方式只能填 pay_billing（现付）"],
+      [/Schema v1\.1 仅支持 pay_billing\/pay_arrival\/pay_receipt$/, "v1.1 文件只能填 pay_billing（现付）、pay_arrival（到付）或 pay_receipt（回付）"],
+      [/必须为 v1\.0 或 v1\.1$/, "必须写 v1.0 或 v1.1"],
       [/不得用 (null|undefined) 表示空值$/, "不能写 null 或 undefined，留空就行"],
       [/^(.*)：(\S+) 重复$/, "$1：$2 和别的行重复了"],
       [/不允许公式单元格（(.+)）$/, "这些格子里是公式，请改成实际的值：$1"],

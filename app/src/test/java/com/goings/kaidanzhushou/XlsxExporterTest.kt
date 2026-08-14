@@ -26,8 +26,12 @@ class XlsxExporterTest {
             val sheet = workbook.getSheet("导入数据")
             assertEquals(count, sheet.lastRowNum)
             assertEquals(XlsxExporter.COLUMNS, (0 until 16).map { sheet.getRow(0).getCell(it).stringCellValue })
-            assertEquals("v1.0", sheet.getRow(1).getCell(0).stringCellValue)
+            assertEquals("v1.1", sheet.getRow(1).getCell(0).stringCellValue)
             assertEquals("pay_billing", sheet.getRow(1).getCell(15).stringCellValue)
+            if (count >= 3) {
+                assertEquals("pay_arrival", sheet.getRow(2).getCell(15).stringCellValue)
+                assertEquals("pay_receipt", sheet.getRow(3).getCell(15).stringCellValue)
+            }
             assertEquals(1.0, sheet.getRow(1).getCell(11).numericCellValue, 0.0)
             for (row in sheet) for (cell in row) assertFalse("不允许公式", cell.cellType.name == "FORMULA")
         }
@@ -40,5 +44,6 @@ class XlsxExporterTest {
         destinationText = "杭州", deliveryType = "delivery", senderName = "张三", receiverName = "李四",
         receiverMobile = if (index == 1) null else "13800000000", goodsName = "配件", packageName = null,
         quantity = index, weight = 2.5, volume = null, freight = 10.25,
+        paymentType = listOf("pay_billing", "pay_arrival", "pay_receipt")[(index - 1) % 3],
     )
 }

@@ -15,6 +15,9 @@ import com.goings.kaidanzhushou.domain.SourceNaming
 import com.goings.kaidanzhushou.image.ImageStore
 import java.io.File
 import java.util.UUID
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -33,6 +36,15 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
         return id
     }
 
+    suspend fun createDatedBatch(now: Long = System.currentTimeMillis()): String {
+        val base = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(now))
+        val existing = dao.getBatchNames(base).toSet()
+        val name = if (base !in existing) base else generateSequence(2) { it + 1 }
+            .map { "$base ($it)" }
+            .first { it !in existing }
+        return createBatch(name)
+    }
+
     suspend fun renameBatch(id: String, name: String) {
         val batch = dao.getBatch(id) ?: return
         dao.updateBatch(batch.copy(name = name.trim().ifBlank { batch.name }, updatedAt = System.currentTimeMillis()))
@@ -41,6 +53,19 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
     suspend fun deleteBatch(id: String) {
         dao.getBatch(id)?.let { batch -> dao.deleteBatch(batch) }
         images.deleteBatch(id)
+    }
+
+    suspend fun deleteRecords(batchId: String, ids: Set<String>): Int = withContext(Dispatchers.IO) {
+        if (ids.isEmpty()) return@withContext 0
+        val records = dao.getRecords(batchId).filter { it.id in ids }
+        db.withTransaction {
+            dao.deleteRecords(records.map { it.id })
+            dao.bumpRevision(batchId)
+        }
+        records.forEach { record ->
+            images.deleteRecord(record.id, listOf(record.originalPath, record.documentPath, record.uploadPath, record.thumbnailPath))
+        }
+        records.size
     }
 
     suspend fun addImported(batchId: String, uris: List<Uri>): Int = withContext(Dispatchers.IO) {
@@ -68,13 +93,14 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
 
     private suspend fun addStored(batchId: String, id: String, original: File, upload: File, thumb: File, blur: Boolean, dark: Boolean) {
         db.withTransaction {
-            val ordinal = dao.recordCount(batchId) + 1
+            // Deleted records keep their labels; new photos always receive a fresh, non-conflicting ordinal.
+            val ordinal = dao.nextOrdinal(batchId)
             val now = System.currentTimeMillis()
             dao.insertRecord(RecordEntity(
                 id = id, batchId = batchId, ordinal = ordinal,
                 sourceLabel = SourceNaming.label(ordinal), originalPath = original.absolutePath,
                 uploadPath = upload.absolutePath, thumbnailPath = thumb.absolutePath, capturedAt = now,
-                blurWarning = blur, darknessWarning = dark,
+                documentPath = null, blurWarning = blur, darknessWarning = dark, edgeDetectionWarning = false,
             ))
             dao.bumpRevision(batchId)
         }
@@ -90,6 +116,7 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
                 senderName = fields.senderName, receiverName = fields.receiverName, receiverMobile = fields.receiverMobile,
                 goodsName = fields.goodsName, packageName = fields.packageName, quantity = fields.quantity,
                 weight = fields.weight, volume = fields.volume, freight = fields.freight, editedFields = edited,
+                paymentType = fields.paymentType,
                 reviewStatus = if (issues.isEmpty() && old.reviewStatus == ReviewStatus.CONFIRMED) ReviewStatus.CONFIRMED else ReviewStatus.NEEDS_REVIEW,
                 updatedAt = System.currentTimeMillis(),
             ))
@@ -126,7 +153,8 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
                 weight = keep("weight", old.weight, draft.weight),
                 volume = keep("volume", old.volume, draft.volume),
                 freight = keep("freight", old.freight, draft.freight),
-                uncertainFields = draft.uncertain_fields.joinToString(","), notes = draft.notes,
+                paymentType = keep("payment_type", old.paymentType, draft.payment_type),
+                uncertainFields = "", notes = null,
                 errorMessage = null, updatedAt = System.currentTimeMillis(),
             )
             dao.updateRecord(updated)

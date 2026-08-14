@@ -1,6 +1,5 @@
 package com.goings.kaidanzhushou.image
 
-import android.content.ContentResolver
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -9,10 +8,14 @@ import androidx.exifinterface.media.ExifInterface
 import java.io.File
 import java.io.FileOutputStream
 import kotlin.math.max
-import kotlin.math.sqrt
 
 data class ImageQuality(val blurWarning: Boolean, val darknessWarning: Boolean)
-data class StoredImage(val original: File, val upload: File, val thumbnail: File, val quality: ImageQuality)
+data class StoredImage(
+    val original: File,
+    val upload: File,
+    val thumbnail: File,
+    val quality: ImageQuality,
+)
 
 class ImageStore(private val context: Context) {
     fun cameraFile(batchId: String): File {
@@ -44,6 +47,10 @@ class ImageStore(private val context: Context) {
 
     fun deleteBatch(batchId: String) {
         File(context.filesDir, "photos/$batchId").deleteRecursively()
+    }
+
+    fun deleteRecord(recordId: String, paths: List<String?>) {
+        paths.filterNotNull().map(::File).forEach { file -> if (file.nameWithoutExtension == recordId) file.delete() }
     }
 
     private fun originalFile(batchId: String, recordId: String): File =

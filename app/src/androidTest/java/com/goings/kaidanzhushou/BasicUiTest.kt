@@ -1,22 +1,29 @@
 package com.goings.kaidanzhushou
 
-import androidx.compose.ui.test.assertIsEnabled
-import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
-import androidx.compose.ui.test.performTextInput
-import com.goings.kaidanzhushou.ui.BatchNameDialog
+import androidx.compose.ui.test.performClick
+import com.goings.kaidanzhushou.domain.PaymentType
+import com.goings.kaidanzhushou.ui.IosSegments
 import com.goings.kaidanzhushou.ui.theme.KaidanTheme
+import org.junit.Assert.assertEquals
 import org.junit.Rule
 import org.junit.Test
 
 class BasicUiTest {
     @get:Rule val compose = createComposeRule()
 
-    @Test fun newBatchRequiresAName() {
-        compose.setContent { KaidanTheme { BatchNameDialog("新建照片集", onDismiss = {}, onConfirm = {}) } }
-        compose.onNodeWithText("确定").assertIsNotEnabled()
-        compose.onNodeWithText("照片集名称").performTextInput("测试批次")
-        compose.onNodeWithText("确定").assertIsEnabled()
+    @Test fun paymentSelectorShowsAndSelectsAllThreeTypes() {
+        var selected: String? = null
+        compose.setContent {
+            KaidanTheme {
+                IosSegments(PaymentType.entries.map { it.code to it.label }, selected) { selected = it }
+            }
+        }
+        compose.onNodeWithText("现付").assertIsDisplayed()
+        compose.onNodeWithText("提付").performClick()
+        compose.runOnIdle { assertEquals("pay_arrival", selected) }
+        compose.onNodeWithText("回付").assertIsDisplayed()
     }
 }

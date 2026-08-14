@@ -5,18 +5,24 @@ import kotlin.math.pow
 import kotlin.random.Random
 
 class AdaptiveConcurrency {
-    var limit: Int = 1
+    @Volatile
+    var limit: Int = 4
         private set
     private var successes = 0
 
+    @Synchronized
     fun success() {
         successes++
         if (limit == 1 && successes >= 5) { limit = 2; successes = 0 }
         else if (limit == 2 && successes >= 5) { limit = 4; successes = 0 }
     }
 
+    @Synchronized
     fun failure(kind: KimiErrorKind) {
-        if (kind == KimiErrorKind.RATE_LIMIT) limit = 1
+        if (kind == KimiErrorKind.RATE_LIMIT) limit = when (limit) {
+            4 -> 2
+            else -> 1
+        }
         successes = 0
     }
 }

@@ -32,11 +32,11 @@ class XlsxExporter {
             val row = index + 2
             append("<row r=\"$row\">")
             val values = listOf(
-                Cell.Text("v1.0"), Cell.Text(batch.id), Cell.Text(record.id), Cell.Text(record.sourceLabel),
+                Cell.Text("v1.1"), Cell.Text(batch.id), Cell.Text(record.id), Cell.Text(record.sourceLabel),
                 Cell.Text(record.destinationText), Cell.Text(record.deliveryType), Cell.Text(record.senderName),
                 Cell.Text(record.receiverName), Cell.Text(record.receiverMobile), Cell.Text(record.goodsName),
                 Cell.Text(record.packageName), Cell.Number(record.quantity), Cell.Number(record.weight),
-                Cell.Number(record.volume), Cell.Number(record.freight), Cell.Text("pay_billing"),
+                Cell.Number(record.volume), Cell.Number(record.freight), Cell.Text(record.paymentType),
             )
             values.forEachIndexed { column, value ->
                 when (value) {

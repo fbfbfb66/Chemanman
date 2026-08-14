@@ -5,6 +5,16 @@ import kotlinx.serialization.SerialName
 
 enum class RecognitionStatus { UNRECOGNIZED, QUEUED, PREPARING, IN_FLIGHT, PARSED, RETRY_WAIT, FAILED }
 enum class ReviewStatus { UNREVIEWED, NEEDS_REVIEW, CONFIRMED }
+enum class PaymentType(val code: String, val label: String) {
+    BILLING("pay_billing", "现付"),
+    ARRIVAL("pay_arrival", "提付"),
+    RECEIPT("pay_receipt", "回付");
+
+    companion object {
+        val codes = entries.mapTo(linkedSetOf()) { it.code }
+        fun fromCode(code: String?) = entries.firstOrNull { it.code == code }
+    }
+}
 
 @Serializable
 data class RecognitionDraft(
@@ -19,8 +29,7 @@ data class RecognitionDraft(
     val weight: Double? = null,
     val volume: Double? = null,
     val freight: Double? = null,
-    val uncertain_fields: List<String> = emptyList(),
-    val notes: String? = null,
+    val payment_type: String? = null,
 )
 
 data class EditableFields(
@@ -35,6 +44,7 @@ data class EditableFields(
     val weight: Double? = null,
     val volume: Double? = null,
     val freight: Double? = null,
+    val paymentType: String? = null,
 )
 
 data class ValidationIssue(val field: String, val message: String)
@@ -52,6 +62,7 @@ object RecordValidator {
         if (fields.freight != null && (fields.freight < 0 || fields.freight * 100 % 1 != 0.0)) {
             add(ValidationIssue("freight", "运费不能小于 0，且最多两位小数"))
         }
+        if (fields.paymentType !in PaymentType.codes) add(ValidationIssue("payment_type", "请选择付款方式"))
     }
 }
 

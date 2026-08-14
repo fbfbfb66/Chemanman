@@ -30,6 +30,9 @@ interface KaidanDao {
     @Query("SELECT * FROM batches WHERE id = :id")
     suspend fun getBatch(id: String): BatchEntity?
 
+    @Query("SELECT name FROM batches WHERE name LIKE :prefix || '%'")
+    suspend fun getBatchNames(prefix: String): List<String>
+
     @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insertBatch(batch: BatchEntity)
 
@@ -51,6 +54,9 @@ interface KaidanDao {
     @Query("SELECT COUNT(*) FROM records WHERE batchId = :batchId")
     suspend fun recordCount(batchId: String): Int
 
+    @Query("SELECT COALESCE(MAX(ordinal), 0) + 1 FROM records WHERE batchId = :batchId")
+    suspend fun nextOrdinal(batchId: String): Int
+
     @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insertRecord(record: RecordEntity)
 
@@ -61,6 +67,9 @@ interface KaidanDao {
 
     @Query("DELETE FROM records WHERE id = :id")
     suspend fun deleteRecordById(id: String)
+
+    @Query("DELETE FROM records WHERE id IN (:ids)")
+    suspend fun deleteRecords(ids: List<String>)
 
     @Query("UPDATE records SET recognitionStatus = :to, errorMessage = NULL WHERE batchId = :batchId AND recognitionStatus IN (:from)")
     suspend fun moveRecognitionStates(batchId: String, from: List<RecognitionStatus>, to: RecognitionStatus)
