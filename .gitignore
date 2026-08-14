@@ -1,0 +1,15 @@
+# 敏感抓包与压缩证据
+Har/
+*.har
+*.zip
+
+# 本地构建、诊断与运行报告
+.codex-work/
+reports/
+*.log
+*.inspect.ndjson
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+
