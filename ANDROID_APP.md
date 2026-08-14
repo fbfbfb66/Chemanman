@@ -21,18 +21,18 @@ Debug APK 生成于 `app/build/outputs/apk/debug/app-debug.apk`。
 
 ## 数据与隐私
 
-- 原图规范化为最长边 4096px 的高质量 JPEG；Kimi 上传副本最长边 2200px。
+- 保留最长边 4096px 的原图；Kimi 上传副本最长边 2200px。
 - 图片、Room 数据库和导出副本位于 App 私有目录，不会自动删除或备份。
 - API Key 使用 Android Keystore AES-256-GCM 加密，不进入源码、构建配置或日志。
-- 相册导入使用系统 Photo Picker，Excel 另存使用系统文件选择器，因此不申请广泛存储权限。
+- 相册导入使用系统 Photo Picker。Excel 直接写入 `下载/开单助手`；API 26–28 首次导出时请求旧版写入权限。
 - 只有用户明确点击“开始 AI 识别”后才会上传图片。
 
 ## 识别与导出
 
-- Kimi 使用 `kimi-k3`、流式 Chat Completions、`reasoning_effort=high` 和严格 JSON Schema。
-- WorkManager 队列从并发 1 开始，连续成功后升到 2/4；遇到 429 立即降回 1。
+- Kimi 使用支持视觉输入的 `kimi-k2.6`、流式 Chat Completions、关闭深度思考模式和严格 JSON Schema。
+- WorkManager 队列默认立即并发 4 路；遇到 429 自动降到 2/1，连续成功后再恢复到 2/4。
 - 网络、429、5xx 最多重试 3 次；401、余额不足和永久参数错误暂停整批。
-- 导出前必须逐条人工确认。XLSX 工作表固定为“导入数据”，包含 Schema v1.0 的 16 列，不生成公式。
+- 导出前必须逐条人工确认。XLSX 工作表固定为“导入数据”，包含 Schema v1.1 的 16 列，不生成公式；付款方式支持现付、提付（系统到付）和回付。
 
 ## 尚需真机验收
 

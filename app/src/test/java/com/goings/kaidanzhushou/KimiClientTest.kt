@@ -15,9 +15,10 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
+import java.util.concurrent.TimeUnit
 
 class KimiClientTest {
-    private val payload = """{"destination_text":"杭州","delivery_type":"delivery","sender_name":"张三","receiver_name":"李四","receiver_mobile":null,"goods_name":"配件","package":null,"quantity":2,"weight":12.5,"volume":null,"freight":8,"uncertain_fields":["receiver_mobile"],"notes":null}"""
+    private val payload = """{"destination_text":"杭州","delivery_type":"delivery","sender_name":"张三","receiver_name":"李四","receiver_mobile":null,"goods_name":"配件","package":null,"quantity":2,"weight":12.5,"volume":null,"freight":8,"payment_type":"pay_arrival"}"""
 
     @Test fun parsesMultiChunkSse() {
         val first = payload.substring(0, 80)
@@ -40,9 +41,17 @@ class KimiClientTest {
             val result = client.recognize("test-key", file)
             assertEquals("杭州", result.destination_text)
             assertEquals(2, result.quantity)
+            assertEquals("pay_arrival", result.payment_type)
             val request = server.takeRequest()
             assertEquals("Bearer test-key", request.getHeader("Authorization"))
-            assertTrue(request.body.readUtf8().contains("kimi-k3"))
+            val requestJson = request.body.readUtf8()
+            assertTrue(requestJson.contains("kimi-k2.6"))
+            assertTrue(requestJson.contains("\"thinking\":{\"type\":\"disabled\"}"))
+            assertTrue(requestJson.contains("pay_arrival"))
+            assertTrue(requestJson.contains("pay_receipt"))
+            assertTrue(requestJson.contains("发货地点永远是昆明，到站不可能是昆明"))
+            assertTrue(requestJson.contains("若单据上显示两个到站，以被打勾标注的到站为准"))
+            assertTrue(requestJson.contains("“收货方”就是收货人"))
             file.delete()
         } finally { server.shutdown() }
         }
@@ -52,6 +61,16 @@ class KimiClientTest {
         val client = KimiClient(OkHttpClient(), baseUrl = "http://localhost/")
         val error = runCatching { client.parseDraft("{\"destination_text\":\"杭州\"}") }.exceptionOrNull() as KimiException
         assertEquals(KimiErrorKind.INVALID_RESPONSE, error.kind)
+    }
+
+    @Test fun paymentTypesAreStrictAndMayBeNull() {
+        val client = KimiClient(OkHttpClient(), baseUrl = "http://localhost/")
+        listOf("pay_billing", "pay_arrival", "pay_receipt").forEach { payment ->
+            assertEquals(payment, client.parseDraft(payload.replace("pay_arrival", payment)).payment_type)
+        }
+        val invalid = runCatching { client.parseDraft(payload.replace("pay_arrival", "cash")) }.exceptionOrNull() as KimiException
+        assertEquals(KimiErrorKind.INVALID_RESPONSE, invalid.kind)
+        assertEquals(null, client.parseDraft(payload.replace("\"pay_arrival\"", "null")).payment_type)
     }
 
     @Test fun rateLimitCarriesRetryAfter() {
@@ -64,6 +83,27 @@ class KimiClientTest {
             val error = runCatching { client.recognize("test", file) }.exceptionOrNull() as KimiException
             assertEquals(KimiErrorKind.RATE_LIMIT, error.kind)
             assertEquals(2000L, error.retryAfterMillis)
+            file.delete()
+        } finally { server.shutdown() }
+        }
+    }
+
+    @Test fun timeoutAutomaticallyResendsOnce() {
+        runBlocking {
+        val server = MockWebServer(); server.start()
+        try {
+            val chunk = "data: {\"choices\":[{\"delta\":{\"content\":${Json.encodeToString(payload)}}}]}\n\ndata: [DONE]\n\n"
+            server.enqueue(MockResponse().setResponseCode(200).setBody(chunk).setBodyDelay(300, TimeUnit.MILLISECONDS))
+            server.enqueue(MockResponse().setResponseCode(200).setBody(chunk))
+            val file = File.createTempFile("waybill", ".jpg").apply { writeBytes(byteArrayOf(1, 2, 3)) }
+            val client = KimiClient(
+                OkHttpClient(),
+                baseUrl = server.url("/v1/").toString(),
+                requestTimeoutMillis = 100,
+            )
+
+            assertEquals("杭州", client.recognize("test", file).destination_text)
+            assertEquals(2, server.requestCount)
             file.delete()
         } finally { server.shutdown() }
         }

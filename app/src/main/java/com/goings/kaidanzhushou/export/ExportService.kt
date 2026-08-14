@@ -16,8 +16,9 @@ class ExportService(
     private val context: Context,
     private val repository: BatchRepository,
     private val exporter: XlsxExporter,
+    private val publicWriter: PublicExportWriter,
 ) {
-    suspend fun export(batchId: String): File = withContext(Dispatchers.IO) {
+    suspend fun export(batchId: String): ExportEntity = withContext(Dispatchers.IO) {
         val batch = repository.dao.getBatch(batchId) ?: error("照片集不存在")
         val records = repository.dao.getRecords(batchId)
         require(records.isNotEmpty()) { "照片集没有可导出的记录" }
@@ -26,11 +27,14 @@ class ExportService(
         val safeName = batch.name.replace(Regex("[\\/:*?\"<>|]"), "_").take(40)
         val file = File(context.filesDir, "exports/${safeName}_$stamp.xlsx")
         exporter.write(file, batch, records)
-        repository.saveExport(ExportEntity(
+        val publicUri = publicWriter.publish(file)
+        val export = ExportEntity(
             id = UUID.randomUUID().toString(), batchId = batchId, fileName = file.name,
             exportedAt = System.currentTimeMillis(), recordCount = records.size,
             dataRevision = batch.dataRevision, localPath = file.absolutePath,
-        ))
-        file
+            publicUri = publicUri.toString(),
+        )
+        repository.saveExport(export)
+        export
     }
 }

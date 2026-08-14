@@ -53,6 +53,9 @@ data class RecordEntity(
     val weight: Double? = null,
     val volume: Double? = null,
     val freight: Double? = null,
+    val paymentType: String? = null,
+    val documentPath: String? = null,
+    val edgeDetectionWarning: Boolean = false,
     val uncertainFields: String = "",
     val editedFields: String = "",
     val notes: String? = null,
@@ -62,7 +65,7 @@ data class RecordEntity(
 ) {
     fun editable() = EditableFields(
         destinationText, deliveryType, senderName, receiverName, receiverMobile,
-        goodsName, packageName, quantity, weight, volume, freight,
+        goodsName, packageName, quantity, weight, volume, freight, paymentType,
     )
 
     fun uncertainFieldSet(): Set<String> = uncertainFields.split(',').filter(String::isNotBlank).toSet()
@@ -87,6 +90,7 @@ data class ExportEntity(
     val recordCount: Int,
     val dataRevision: Long,
     val localPath: String,
+    val publicUri: String? = null,
 )
 
 data class BatchWithStats(

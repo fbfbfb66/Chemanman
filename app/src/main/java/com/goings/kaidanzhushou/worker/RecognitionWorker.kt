@@ -34,7 +34,7 @@ class RecognitionWorker(context: Context, params: WorkerParameters) : CoroutineW
             if (batch.recognitionPaused) return Result.success()
             val pending = dao.recordsWithStatus(batchId, listOf(RecognitionStatus.QUEUED)).take(controller.limit)
             if (pending.isEmpty()) break
-            setForeground(foreground("正在识别 ${pending.first().sourceLabel}"))
+            setForeground(foreground("正在并行识别 ${pending.size} 张托运单"))
             coroutineScope { pending.map { async { process(it) } }.awaitAll() }
         }
         return Result.success()

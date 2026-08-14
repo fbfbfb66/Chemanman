@@ -2,6 +2,7 @@ package com.goings.kaidanzhushou.data.remote
 
 import com.goings.kaidanzhushou.BuildConfig
 import com.goings.kaidanzhushou.domain.RecognitionDraft
+import com.goings.kaidanzhushou.domain.PaymentType
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -21,9 +22,11 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.util.Base64
+import java.util.concurrent.TimeUnit
 
-enum class KimiErrorKind { UNAUTHORIZED, QUOTA, RATE_LIMIT, SERVER, NETWORK, PERMANENT, INVALID_RESPONSE }
+enum class KimiErrorKind { UNAUTHORIZED, QUOTA, RATE_LIMIT, SERVER, NETWORK, TIMEOUT, PERMANENT, INVALID_RESPONSE }
 
 class KimiException(
     val kind: KimiErrorKind,
@@ -35,6 +38,7 @@ class KimiClient(
     private val http: OkHttpClient,
     private val json: Json = Json { ignoreUnknownKeys = true; explicitNulls = false },
     private val baseUrl: String = BuildConfig.KIMI_BASE_URL,
+    private val requestTimeoutMillis: Long = 15_000,
 ) {
     suspend fun recognize(apiKey: String, image: File): RecognitionDraft = withContext(Dispatchers.IO) {
         val request = Request.Builder()
@@ -43,36 +47,44 @@ class KimiClient(
             .header("Accept", "text/event-stream")
             .post(requestBody(image).toString().toRequestBody(JSON_MEDIA))
             .build()
-        try {
-            http.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    val safeMessage = when (response.code) {
-                        401 -> "API Key 无效或已失效"
-                        402 -> "Kimi 账户余额不足"
-                        429 -> "请求过于频繁，稍后自动重试"
-                        in 500..599 -> "Kimi 服务暂时不可用"
-                        else -> "Kimi 请求参数错误（${response.code}）"
+        for (sendAttempt in 0..1) {
+            try {
+                val call = http.newCall(request)
+                call.timeout().timeout(requestTimeoutMillis, TimeUnit.MILLISECONDS)
+                call.execute().use { response ->
+                    if (!response.isSuccessful) {
+                        val safeMessage = when (response.code) {
+                            401 -> "API Key 无效或已失效"
+                            402 -> "Kimi 账户余额不足"
+                            429 -> "请求过于频繁，稍后自动重试"
+                            in 500..599 -> "Kimi 服务暂时不可用"
+                            else -> "Kimi 请求参数错误（${response.code}）"
+                        }
+                        val bodyHint = response.body?.string().orEmpty().lowercase()
+                        val kind = when {
+                            response.code == 401 -> KimiErrorKind.UNAUTHORIZED
+                            response.code == 402 || "balance" in bodyHint || "quota" in bodyHint || "余额" in bodyHint -> KimiErrorKind.QUOTA
+                            response.code == 429 -> KimiErrorKind.RATE_LIMIT
+                            response.code >= 500 -> KimiErrorKind.SERVER
+                            else -> KimiErrorKind.PERMANENT
+                        }
+                        val retry = response.header("Retry-After")?.toDoubleOrNull()?.times(1000)?.toLong()
+                        throw KimiException(kind, safeMessage, retry)
                     }
-                    val bodyHint = response.body?.string().orEmpty().lowercase()
-                    val kind = when {
-                        response.code == 401 -> KimiErrorKind.UNAUTHORIZED
-                        response.code == 402 || "balance" in bodyHint || "quota" in bodyHint || "余额" in bodyHint -> KimiErrorKind.QUOTA
-                        response.code == 429 -> KimiErrorKind.RATE_LIMIT
-                        response.code >= 500 -> KimiErrorKind.SERVER
-                        else -> KimiErrorKind.PERMANENT
-                    }
-                    val retry = response.header("Retry-After")?.toDoubleOrNull()?.times(1000)?.toLong()
-                    throw KimiException(kind, safeMessage, retry)
+                    val body = response.body ?: throw KimiException(KimiErrorKind.INVALID_RESPONSE, "Kimi 返回空响应")
+                    val content = SseContentParser(json).parse(body.source())
+                    return@withContext parseDraft(content)
                 }
-                val body = response.body ?: throw KimiException(KimiErrorKind.INVALID_RESPONSE, "Kimi 返回空响应")
-                val content = SseContentParser(json).parse(body.source())
-                parseDraft(content)
+            } catch (error: KimiException) {
+                throw error
+            } catch (_: InterruptedIOException) {
+                if (sendAttempt == 0) continue
+                throw KimiException(KimiErrorKind.TIMEOUT, "AI 识别超时，已自动重试一次")
+            } catch (_: IOException) {
+                throw KimiException(KimiErrorKind.NETWORK, "网络连接失败")
             }
-        } catch (e: KimiException) {
-            throw e
-        } catch (e: IOException) {
-            throw KimiException(KimiErrorKind.NETWORK, "网络连接失败")
         }
+        throw KimiException(KimiErrorKind.TIMEOUT, "AI 识别超时，已自动重试一次")
     }
 
     internal fun parseDraft(content: String): RecognitionDraft = try {
@@ -80,7 +92,14 @@ class KimiClient(
         if (!REQUIRED_FIELDS.all(objectValue::containsKey)) {
             throw KimiException(KimiErrorKind.INVALID_RESPONSE, "AI 返回字段不完整")
         }
-        json.decodeFromString<RecognitionDraft>(content)
+        json.decodeFromString<RecognitionDraft>(content).also { draft ->
+            if (draft.delivery_type != null && draft.delivery_type !in setOf("delivery", "pickup")) {
+                throw KimiException(KimiErrorKind.INVALID_RESPONSE, "AI 返回配送方式无效")
+            }
+            if (draft.payment_type != null && draft.payment_type !in PaymentType.codes) {
+                throw KimiException(KimiErrorKind.INVALID_RESPONSE, "AI 返回付款方式无效")
+            }
+        }
     } catch (error: KimiException) {
         throw error
     } catch (_: Exception) {
@@ -90,9 +109,9 @@ class KimiClient(
     private fun requestBody(image: File): JsonObject {
         val encoded = Base64.getEncoder().encodeToString(image.readBytes())
         return buildJsonObject {
-            put("model", JsonPrimitive("kimi-k3"))
+            put("model", JsonPrimitive(MODEL))
             put("stream", JsonPrimitive(true))
-            put("reasoning_effort", JsonPrimitive("high"))
+            put("thinking", buildJsonObject { put("type", JsonPrimitive("disabled")) })
             put("messages", buildJsonArray {
                 add(buildJsonObject {
                     put("role", JsonPrimitive("user"))
@@ -111,7 +130,7 @@ class KimiClient(
             put("response_format", buildJsonObject {
                 put("type", JsonPrimitive("json_schema"))
                 put("json_schema", buildJsonObject {
-                    put("name", JsonPrimitive("waybill_record_v1"))
+                    put("name", JsonPrimitive("waybill_record_v1_1"))
                     put("strict", JsonPrimitive(true))
                     put("schema", schema())
                 })
@@ -125,35 +144,36 @@ class KimiClient(
             put("type", JsonPrimitive("object"))
             put("additionalProperties", JsonPrimitive(false))
             put("properties", buildJsonObject {
-                listOf("destination_text", "sender_name", "receiver_name", "receiver_mobile", "goods_name", "package", "notes").forEach {
+                listOf("destination_text", "sender_name", "receiver_name", "receiver_mobile", "goods_name", "package").forEach {
                     put(it, buildJsonObject { put("type", nullable("string")) })
                 }
                 put("delivery_type", buildJsonObject {
                     put("type", nullable("string"))
                     put("enum", JsonArray(listOf(JsonPrimitive("delivery"), JsonPrimitive("pickup"), JsonNull)))
                 })
+                put("payment_type", buildJsonObject {
+                    put("type", nullable("string"))
+                    put("enum", JsonArray(listOf(JsonPrimitive("pay_billing"), JsonPrimitive("pay_arrival"), JsonPrimitive("pay_receipt"), JsonNull)))
+                })
                 put("quantity", buildJsonObject { put("type", nullable("integer")); put("minimum", JsonPrimitive(1)) })
                 listOf("weight", "volume", "freight").forEach {
                     put(it, buildJsonObject { put("type", nullable("number")); put("minimum", JsonPrimitive(0)) })
                 }
-                put("uncertain_fields", buildJsonObject {
-                    put("type", JsonPrimitive("array"))
-                    put("items", buildJsonObject { put("type", JsonPrimitive("string")) })
-                })
             })
             put("required", JsonArray(listOf(
                 "destination_text", "delivery_type", "sender_name", "receiver_name", "receiver_mobile",
-                "goods_name", "package", "quantity", "weight", "volume", "freight", "uncertain_fields", "notes",
+                "goods_name", "package", "quantity", "weight", "volume", "freight", "payment_type",
             ).map(::JsonPrimitive)))
         }
     }
 
     private companion object {
         val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
+        const val MODEL = "kimi-k2.6"
         val REQUIRED_FIELDS = setOf(
             "destination_text", "delivery_type", "sender_name", "receiver_name", "receiver_mobile",
-            "goods_name", "package", "quantity", "weight", "volume", "freight", "uncertain_fields", "notes",
+            "goods_name", "package", "quantity", "weight", "volume", "freight", "payment_type",
         )
-        const val PROMPT = """你是托运单录入助手。只提取图片中明确可见的信息，禁止推测、补全或编造。无法确认的字段必须返回 null，并把字段名加入 uncertain_fields。delivery_type 只能是 delivery（送货）或 pickup（自提）。quantity 为件数；weight、volume、freight 仅返回数字。notes 只记录影响人工核对的简短说明。"""
+        const val PROMPT = """你是托运单录入助手。只提取图片中明确可见的信息，禁止推测、补全或编造。无法确认的字段必须返回 null。delivery_type 只能是 delivery（送货）或 pickup（自提）。付款方式严格映射：单据写“现付”返回 payment_type=pay_billing；写“提付”或“到付”返回 pay_arrival；写“回付”返回 pay_receipt；看不清则返回 null。quantity 为件数；weight、volume、freight 仅返回数字。发货地点永远是昆明，到站不可能是昆明，禁止将昆明填入 destination_text。若单据上显示两个到站，以被打勾标注的到站为准。单据中的“收货方”就是收货人，填入 receiver_name。"""
     }
 }
