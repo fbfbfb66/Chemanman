@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         车满满批量串行自动填写保存
 // @namespace    codex.chemanman.batch-serial.production
-// @version      1.0.13
-// @description  从本地 XLSX 严格逐条填写保存，避免重复点击已活动的新运单页签及其自动菜单。
+// @version      1.2.1
+// @description  从本地 XLSX 严格逐条填写保存。v1.2.1 修正展开订单明细后窗口长出屏幕的定位问题，处理判定与 v1.1.0 一致。
 // @author       User
 // @match        https://t800.chemanman.com/Order*
 // @run-at       document-start
@@ -12,7 +12,7 @@
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "1.0.13";
+  const SCRIPT_VERSION = "1.2.1";
   const CHECKPOINT_VERSION = 3;
   const MAX_ORDERS = 100;
   const SERIAL_CONCURRENCY = 1;
@@ -26,7 +26,22 @@
   const SAVE_BUTTON_TEXT = /^(保存(?:\(F9\))?|保存并打印|保存并关闭|提交运单|继续保存)$/i;
   const DIAGNOSTIC_SCHEMA_VERSION = 1;
   const DIAGNOSTIC_EVENT_LIMIT = 500;
-  const POST_SAVE_COOLDOWN_MS = 3000;
+  const POST_SAVE_COOLDOWN_MS = 6000;
+  // 慢网络超时配置（v1.2.0 放宽）：只推迟失败判定，成功路径在条件满足时立即返回。
+  const SAVE_RESULT_TIMEOUT_MS = 60000;
+  const SAVE_REQUEST_SEEN_TIMEOUT_MS = 10000;
+  const PERFORMANCE_BODY_FALLBACK_MS = 3000;
+  const CREATE_ENTRY_TIMEOUT_MS = 30000;
+  const CREATE_RESULT_TIMEOUT_MS = 30000;
+  const TAB_SWITCH_TIMEOUT_MS = 10000;
+  const REBIND_TIMEOUT_MS = 15000;
+  const TAB_CLOSE_TIMEOUT_MS = 8000;
+  const DATALIST_FIRST_POLL_MS = 4800;
+  const DATALIST_RETRY_POLL_MS = 9000;
+  const DATALIST_CONFIRM_TIMEOUT_MS = 7000;
+  const SELECT_FIRST_POLL_MS = 3600;
+  const SELECT_RETRY_POLL_MS = 7000;
+  const SELECT_CONFIRM_TIMEOUT_MS = 6000;
   const BRIDGE_EVENT = `cm-save-observer-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const TEXT_DECODER = new TextDecoder("utf-8");
   const REQUIRED_HEADERS = [
@@ -56,11 +71,16 @@
     "interrupted_manual", "order_number_blocked", "create_entry_blocked", "abandon_pending_close",
     "legacy_checkpoint_blocked",
   ]);
+  // 这些状态从未触发过保存请求；页面重开后网站会清理未选中的旧页签，检查点恢复时可安全重新排队。
+  const PRE_SAVE_STATES = new Set([
+    "creating", "waiting_create_entry", "direct_filling", "custom_pending", "custom_filling",
+    "verifying", "ready_to_save", "mapping_failed", "manual_pending", "order_number_blocked", "create_entry_blocked",
+  ]);
 
   const state = {
     tasks: [], parsedImport: null, importErrors: [], duplicateKeys: [], fileName: "", batchId: "",
     running: false, batchStarted: false, pauseRequested: false, stopRequested: false, globalHalt: "",
-    authorization: false, safetyBlocks: 0, savePermit: null, clickPermitId: "", baselineTabs: new Set(),
+    authorization: false, safetyBlocks: 0, savePermit: null, clickPermitId: "", baselineTabs: new WeakSet(),
     recovered: false, legacyCheckpoint: false, completed: false, reportExported: false, ui: null,
     diagnostics: { session_id: stableHash(`${Date.now()}-${Math.random()}`), started_at: now(), bridge_ready: false, events: [] },
   };
@@ -322,6 +342,24 @@
       if (event.key !== "F9" && event.code !== "F9") return;
       event.preventDefault(); event.stopImmediatePropagation(); notifySafetyBlock("keyboard", "F9");
     }, true);
+    window.addEventListener("error", (event) => {
+      recordDiagnostic("unhandled_error", { message: event?.error ? errorMessage(event.error) : String(event?.message || ""), source: "window.error" });
+    });
+    window.addEventListener("unhandledrejection", (event) => {
+      recordDiagnostic("unhandled_error", { message: errorMessage(event?.reason), source: "unhandledrejection" });
+    });
+    document.addEventListener("visibilitychange", () => {
+      recordDiagnostic("visibility_changed", { visibility: document.visibilityState, running: state.running, batch_started: state.batchStarted });
+      if (document.hidden && state.batchStarted && !state.completed && state.running) {
+        setStatus("页面已切到后台；浏览器会拖慢后台页面的计时，可能误判超时。请保持本页面在前台。", "warning");
+      }
+    });
+    window.addEventListener("beforeunload", (event) => {
+      const permitPending = state.savePermit && state.savePermit.status !== "settled";
+      if (!state.running && !permitPending) return;
+      event.preventDefault();
+      event.returnValue = "批次正在运行，关闭页面会中断当前订单。";
+    });
   }
 
   function installDirectResponseObserver() {
@@ -370,7 +408,7 @@
           if (!permit.performanceFallbackTimer) {
             permit.performanceFallbackTimer = setTimeout(() => {
               if (permit.status !== "settled") settleSavePermit(permit, ambiguousSave("检测到保存请求已经完成，但网站读取响应时仍未向脚本暴露结果；请导出诊断JSON并查询订单列表确认", "performance"));
-            }, 1500);
+            }, PERFORMANCE_BODY_FALLBACK_MS);
           }
         }
       });
@@ -397,7 +435,7 @@
       settleSavePermit(permit, permit.status === "sent"
         ? ambiguousSave("保存请求已发出但等待响应超时；请导出诊断JSON并人工查询订单", permit.channel || "timeout")
         : ambiguousSave("点击保存后未能观察到请求或响应；网站可能已经保存，请导出诊断JSON并查询订单列表确认", "unobserved"));
-    }, 20000);
+    }, SAVE_RESULT_TIMEOUT_MS);
     state.savePermit = permit;
     return permit;
   }
@@ -457,12 +495,27 @@
     renderSummary();
   }
 
+  const UI_POS_KEY = "cm-batch-ui-pos-v1";
+  const UI_DEBUG_KEY = "cm-batch-ui-debug-v1";
+  const panel = { shadow: null, el: {}, open: false, debug: false, drag: null, confirm: null, verClicks: [], doneShown: false };
+
   function initializeUi() {
     if (document.getElementById(PANEL_ID)) return;
     const host = document.createElement("div"); host.id = PANEL_ID;
     const shadow = host.attachShadow({ mode: "open" });
     shadow.innerHTML = buildPanelHtml(); document.documentElement.appendChild(host);
+    panel.shadow = shadow;
     state.ui = Object.fromEntries(["file", "authorize", "start", "pause", "resume", "stop", "export", "diagnostic", "unlock", "newBatch", "discard", "filter", "status", "stats", "rows", "errors"].map((id) => [id, shadow.getElementById(id)]));
+    panel.el = Object.fromEntries([
+      "orb", "orbBadge", "win", "bar", "ver", "btnMin", "recoverBar", "statusRaw",
+      "stageIdle", "stageReady", "stageInvalid", "stageRunning", "stageManual", "stageDone",
+      "drop", "readyName", "readyCount", "readyPreview", "btnGo", "btnRepick",
+      "invalidTitle", "invalidList", "btnRepick2",
+      "runTitle", "runCount", "runFill", "runDetail", "btnResume",
+      "manualTitle", "manualHint", "manualWho", "manualActions", "manualTech", "manualRaw", "manualRest",
+      "doneTitle", "doneText", "detail", "detailHint", "btnExport2", "rawbox",
+      "modal", "modalTitle", "modalText", "modalOk", "modalCancel",
+    ].map((id) => [id, shadow.getElementById(id)]));
     state.ui.file.addEventListener("change", handleFileSelection);
     state.ui.authorize.addEventListener("change", () => { state.authorization = state.ui.authorize.checked; renderSummary(); });
     state.ui.start.addEventListener("click", startBatch);
@@ -476,33 +529,305 @@
     state.ui.discard.addEventListener("click", discardRecoveredBatch);
     state.ui.filter.addEventListener("change", renderSummary);
     shadow.addEventListener("click", handlePanelAction);
+    installPanelChrome();
     restoreCheckpoint();
     if (detectConflictingScript()) state.importErrors = ["检测到旧测试脚本仍在运行。请在油猴中只启用正式版并刷新页面。"];
     renderSummary();
   }
 
+  // 面板外壳：悬浮球、拖动、最小化、拖拽导入、确认弹窗、隐藏调试开关。全部只操作影子树内的节点。
+  function installPanelChrome() {
+    const el = panel.el;
+    try { panel.debug = localStorage.getItem(UI_DEBUG_KEY) === "1"; } catch { panel.debug = false; }
+    el.orb.addEventListener("click", () => setWindowOpen(!panel.open));
+    el.btnMin.addEventListener("click", () => setWindowOpen(false));
+    el.bar.addEventListener("pointerdown", beginDrag);
+    el.bar.addEventListener("pointermove", moveDrag);
+    el.bar.addEventListener("pointerup", endDrag);
+    el.bar.addEventListener("pointercancel", endDrag);
+    el.ver.addEventListener("click", toggleDebugByTaps);
+    el.btnGo.addEventListener("click", () => requestAuthorizedRun("start"));
+    el.btnResume.addEventListener("click", () => requestAuthorizedRun("resume"));
+    el.btnExport2.addEventListener("click", exportReportCsv);
+    for (const button of [el.btnRepick, el.btnRepick2]) button.addEventListener("click", pickFile);
+    el.drop.addEventListener("click", pickFile);
+    el.win.addEventListener("dragover", (event) => { event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = "copy"; el.drop.classList.add("hot"); });
+    el.win.addEventListener("dragleave", () => el.drop.classList.remove("hot"));
+    el.win.addEventListener("drop", acceptDroppedFile);
+    el.modalOk.addEventListener("click", () => panel.confirm?.(true));
+    el.modalCancel.addEventListener("click", () => panel.confirm?.(false));
+    el.modal.addEventListener("click", (event) => { if (event.target === el.modal) panel.confirm?.(false); });
+    window.addEventListener("resize", () => { if (panel.open) applyWindowPosition(panel.pos?.x, panel.pos?.y); });
+    window.addEventListener("keydown", (event) => { if (event.key === "Escape" && panel.confirm) panel.confirm(false); });
+    // 展开/收起「订单明细」会让窗口变高。默认位置贴近屏幕底部，不重新夹取就会长出屏幕外，
+    // 必须手工拖回来。阶段切换与表格行数变化由 renderShell 末尾的同一个函数兜住。
+    el.detail.addEventListener("toggle", reclampWindowPosition);
+  }
+
+  // 内容高度变化后把窗口重新夹回屏幕内。拖动过程中不干预，位置也不写入 localStorage：
+  // 这只是自动避让，用户手工拖到的位置仍然是下次打开时的首选。
+  function reclampWindowPosition() {
+    if (!panel.open || panel.drag || !panel.el.win) return;
+    applyWindowPosition(panel.pos?.x, panel.pos?.y);
+  }
+
+  function setWindowOpen(open) {
+    panel.open = open;
+    panel.el.win.hidden = !open;
+    panel.el.orb.classList.toggle("open", open);
+    if (!open) return;
+    const saved = loadWindowPosition();
+    applyWindowPosition(saved?.x, saved?.y);
+  }
+
+  function loadWindowPosition() {
+    try { const value = JSON.parse(localStorage.getItem(UI_POS_KEY) || "null"); return Number.isFinite(value?.x) && Number.isFinite(value?.y) ? value : null; } catch { return null; }
+  }
+
+  function applyWindowPosition(x, y) {
+    const win = panel.el.win; const width = win.offsetWidth || 720; const height = win.offsetHeight || 520;
+    const maxX = Math.max(8, window.innerWidth - width - 8); const maxY = Math.max(8, window.innerHeight - height - 8);
+    const nextX = Math.min(Math.max(8, Number.isFinite(x) ? x : maxX), maxX);
+    const nextY = Math.min(Math.max(8, Number.isFinite(y) ? y : Math.max(8, maxY - 24)), maxY);
+    win.style.left = `${nextX}px`; win.style.top = `${nextY}px`; panel.pos = { x: nextX, y: nextY };
+  }
+
+  function beginDrag(event) {
+    if (!event.isTrusted || event.button !== 0 || event.target.closest("button")) return;
+    const rect = panel.el.win.getBoundingClientRect();
+    panel.drag = { id: event.pointerId, dx: event.clientX - rect.left, dy: event.clientY - rect.top };
+    try { panel.el.bar.setPointerCapture(event.pointerId); } catch { /* 捕获失败仍可拖动，只是移出标题栏会中断 */ }
+    panel.el.win.classList.add("dragging"); event.preventDefault();
+  }
+
+  function moveDrag(event) {
+    if (!panel.drag || event.pointerId !== panel.drag.id) return;
+    applyWindowPosition(event.clientX - panel.drag.dx, event.clientY - panel.drag.dy);
+  }
+
+  function endDrag(event) {
+    if (!panel.drag || event.pointerId !== panel.drag.id) return;
+    try { panel.el.bar.releasePointerCapture(event.pointerId); } catch { /* 指针已释放 */ }
+    panel.drag = null; panel.el.win.classList.remove("dragging");
+    try { localStorage.setItem(UI_POS_KEY, JSON.stringify(panel.pos)); } catch { /* 存储不可用不影响使用 */ }
+  }
+
+  function pickFile() { if (!state.ui.file.disabled) state.ui.file.click(); }
+
+  function acceptDroppedFile(event) {
+    event.preventDefault(); event.stopPropagation(); panel.el.drop.classList.remove("hot");
+    const file = event.dataTransfer?.files?.[0]; if (!file || state.ui.file.disabled) return;
+    if (!/\.xlsx$/i.test(file.name)) { setStatus("只能用 .xlsx 文件。", "error"); return; }
+    try {
+      const transfer = new DataTransfer(); transfer.items.add(file); state.ui.file.files = transfer.files;
+      state.ui.file.dispatchEvent(new Event("change"));
+    } catch { setStatus("这个文件没能读进来，请改用点击选择。", "error"); }
+  }
+
+  function toggleDebugByTaps() {
+    const stamp = Date.now();
+    panel.verClicks = panel.verClicks.filter((time) => stamp - time < 3000).concat(stamp);
+    if (panel.verClicks.length < 5) return;
+    panel.verClicks = []; panel.debug = !panel.debug;
+    try { localStorage.setItem(UI_DEBUG_KEY, panel.debug ? "1" : ""); } catch { /* 存储不可用不影响使用 */ }
+    setStatus(panel.debug ? "已开启调试模式。" : "已关闭调试模式。");
+    renderSummary();
+  }
+
+  // 应用内确认弹窗，替代浏览器原生 confirm。返回 Promise<boolean>。
+  function uiConfirm(text, options = {}) {
+    const el = panel.el;
+    if (!el.modal) return Promise.resolve(window.confirm(text));
+    panel.confirm?.(false);
+    return new Promise((resolve) => {
+      el.modalTitle.textContent = options.title || "请确认";
+      el.modalText.textContent = text;
+      el.modalOk.textContent = options.okText || "确认";
+      el.modalCancel.textContent = options.cancelText || "取消";
+      el.modalOk.className = options.danger ? "btn solid-danger" : "btn primary";
+      el.modal.hidden = false;
+      setWindowOpen(true);
+      panel.confirm = (value) => { el.modal.hidden = true; panel.confirm = null; resolve(value); };
+    });
+  }
+
+  // 「开始」和「继续」都需要真实保存授权。这里只负责把授权勾选框换成一个说人话的弹窗，
+  // 门禁本身仍由 startBatch / resumeBatch 中原有的 state.authorization 判断决定。
+  async function requestAuthorizedRun(kind) {
+    const proxy = kind === "start" ? state.ui.start : state.ui.resume;
+    if (!state.authorization) {
+      const total = state.tasks.filter((task) => !TERMINAL_STATES.has(task.state)).length;
+      const ok = await uiConfirm(
+        `脚本会在车满满网站上真实创建并保存 ${total} 条订单，保存后不能一键撤销。请确认这批数据已经核对无误。`,
+        { title: kind === "start" ? "确认开始？" : "确认继续？", okText: kind === "start" ? "确认，开始" : "确认，继续" },
+      );
+      if (!ok) return;
+      state.ui.authorize.checked = true; state.authorization = true; renderSummary();
+    }
+    if (proxy.disabled) { renderSummary(); return; }
+    proxy.click();
+  }
+
   function buildPanelHtml() {
     return `
       <style>
-        :host{all:initial}.panel{position:fixed;right:14px;bottom:14px;width:560px;max-height:86vh;z-index:2147483647;color:#172033;background:#fff;border:1px solid #9db4cc;border-radius:10px;box-shadow:0 12px 32px rgba(10,36,64,.28);font:13px/1.4 "Microsoft YaHei",Arial,sans-serif;overflow:hidden}
-        .head{display:flex;justify-content:space-between;padding:10px 12px;background:#17365d;color:#fff}.body{padding:10px;overflow:auto;max-height:calc(86vh - 44px)}
-        .notice{background:#fff2cc;color:#7f6000;border:1px solid #e6cf7a;border-radius:6px;padding:7px}.row{display:flex;gap:7px;align-items:center;margin:8px 0;flex-wrap:wrap}
-        button,select{border:0;border-radius:5px;padding:7px 9px;font:inherit}button{cursor:pointer;background:#e7eef6;color:#17365d}button.primary{background:#2f75b5;color:#fff}button.danger{background:#fde8e8;color:#991b1b}button:disabled{opacity:.42;cursor:not-allowed}
-        input[type=file]{width:100%;font-size:12px}.status{padding:7px;border-radius:6px;background:#eef5fb;white-space:pre-wrap}.status.error{background:#fde8e8;color:#991b1b}.status.warning{background:#fff2cc;color:#7f6000}
-        .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:5px;margin:8px 0}.stat{background:#f4f7fa;border-radius:5px;padding:5px;text-align:center}.stat b{display:block;font-size:15px}
-        table{width:100%;border-collapse:collapse;font-size:11px;table-layout:fixed}th{background:#2f75b5;color:#fff;text-align:left;padding:5px}td{padding:5px;border-bottom:1px solid #dbe5ee;word-break:break-all;vertical-align:top}.actions button{padding:3px 5px;margin:1px;font-size:10px}
-        tr.ok td{background:#e8f5e9}tr.bad td{background:#fde8e8}tr.manual td{background:#fff7df}.errors{color:#991b1b;white-space:pre-wrap;max-height:110px;overflow:auto}
+        :host{all:initial}
+        *{box-sizing:border-box}
+        .orb,.win,.modal{font:14px/1.55 "Microsoft YaHei","PingFang SC",system-ui,Arial,sans-serif;color:#1f2933}
+        .orb{position:fixed;right:22px;bottom:22px;width:56px;height:56px;border:0;border-radius:50%;cursor:pointer;z-index:2147483646;
+          background:#2563eb;color:#fff;display:flex;align-items:center;justify-content:center;box-shadow:0 8px 24px rgba(37,99,235,.42)}
+        .orb:hover{background:#1d4ed8}.orb.open{background:#1e293b;box-shadow:0 8px 24px rgba(15,23,42,.4)}
+        .orb svg{width:26px;height:26px;fill:none;stroke:#fff;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+        .orb .badge{position:absolute;top:-2px;right:-2px;min-width:22px;height:22px;padding:0 6px;border-radius:11px;background:#0f172a;color:#fff;font:600 11px/22px system-ui;text-align:center}
+        .orb.alert{background:#ea580c;box-shadow:0 8px 24px rgba(234,88,12,.45)}.orb.alert .badge{background:#9a3412}
+        .win{position:fixed;left:0;top:0;width:720px;max-width:calc(100vw - 24px);max-height:86vh;z-index:2147483647;display:flex;flex-direction:column;
+          background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 24px 60px rgba(15,23,42,.28),0 0 0 1px rgba(15,23,42,.08)}
+        .win.dragging{user-select:none}
+        .bar{display:flex;align-items:center;gap:10px;padding:12px 14px;background:#0f172a;color:#fff;cursor:move;touch-action:none;user-select:none}
+        .bar b{font-size:15px;font-weight:600}
+        .ver{margin-left:2px;border:0;background:rgba(255,255,255,.14);color:#cbd5e1;border-radius:999px;padding:2px 9px;font:11px/1.6 inherit;cursor:pointer}
+        .bar .sp{flex:1}
+        .iconbtn{border:0;background:rgba(255,255,255,.14);color:#fff;border-radius:8px;padding:5px 11px;font:13px/1.4 inherit;cursor:pointer}
+        .iconbtn:hover{background:rgba(255,255,255,.26)}
+        .scroll{flex:1;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:14px}
+        .stage{display:flex;flex-direction:column;gap:14px}
+        #recoverBar{order:-2}#stageManual{order:-1}
+        .card{border:1px solid #e5e7eb;border-radius:12px;padding:16px;background:#fff}
+        .card.warn{border-color:#fdba74;background:#fff8f1}.card.bad{border-color:#fca5a5;background:#fef2f2}.card.ok{border-color:#86efac;background:#f0fdf4}
+        .ctitle{font-size:16px;font-weight:600;margin-bottom:6px}
+        .ctext{color:#475569}
+        .sub{color:#64748b;font-size:12.5px}
+        .drop{border:2px dashed #cbd5e1;border-radius:14px;padding:38px 20px;text-align:center;cursor:pointer;background:#f8fafc}
+        .drop:hover,.drop.hot{border-color:#2563eb;background:#eff6ff}
+        .drop .big{font-size:17px;font-weight:600;margin:10px 0 4px}
+        .drop .plus{width:46px;height:46px;margin:0 auto;border-radius:50%;background:#e0e7ff;color:#2563eb;font:300 30px/46px system-ui}
+        .cta{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+        .cta .sub{flex:1 1 100%}
+        .btn{border:1px solid #d5dbe3;background:#fff;color:#1f2933;border-radius:9px;padding:9px 16px;font:14px/1.4 inherit;cursor:pointer}
+        .btn:hover:not(:disabled){border-color:#94a3b8;background:#f8fafc}
+        .btn.primary{background:#2563eb;border-color:#2563eb;color:#fff}.btn.primary:hover:not(:disabled){background:#1d4ed8;border-color:#1d4ed8}
+        .btn.big{padding:12px 30px;font-size:15px;font-weight:600}
+        .btn.danger{color:#b91c1c;border-color:#fca5a5}.btn.danger:hover:not(:disabled){background:#fef2f2}
+        .btn.solid-danger{background:#dc2626;border-color:#dc2626;color:#fff}
+        .btn.tiny{padding:5px 11px;font-size:12.5px;border-radius:7px}
+        .btn:disabled{opacity:.45;cursor:not-allowed}
+        .filerow{display:flex;align-items:center;gap:12px}
+        .filerow .ico{width:38px;height:38px;border-radius:9px;background:#eff6ff;color:#2563eb;font:20px/38px system-ui;text-align:center}
+        .filerow .name{font-weight:600;word-break:break-all}
+        .filerow .sp{flex:1}
+        .preview{margin-top:12px;border-top:1px solid #eef2f6;padding-top:10px;font-size:12.5px;color:#475569}
+        .preview div{padding:2px 0}
+        .issues{margin:8px 0 0;padding-left:20px;color:#7f1d1d;max-height:210px;overflow:auto}
+        .issues li{margin:3px 0}
+        .progtop{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:9px}
+        .progtop b{font-size:16px}
+        .track{height:9px;border-radius:99px;background:#e6ebf1;overflow:hidden}
+        .fill{height:100%;background:#2563eb;border-radius:99px;transition:width .25s ease}
+        .who{margin:8px 0;font-size:12.5px;color:#475569}
+        .who b{color:#1f2933}
+        .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:8px;margin:10px 0}
+        .stat{background:#f6f8fa;border-radius:9px;padding:9px;text-align:center}
+        .stat b{display:block;font-size:19px;line-height:1.3}
+        .stat span{font-size:12px;color:#64748b}
+        .detail{border:1px solid #e5e7eb;border-radius:12px;overflow:hidden}
+        .detail>summary{cursor:pointer;padding:11px 14px;background:#f8fafc;display:flex;justify-content:space-between;gap:10px;list-style:none}
+        .detail>summary::-webkit-details-marker{display:none}
+        .detail>summary::before{content:"▸";color:#94a3b8;margin-right:6px}
+        .detail[open]>summary::before{content:"▾"}
+        .detail .inner{padding:12px 14px}
+        .tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+        .tools .sp{flex:1}
+        select{border:1px solid #d5dbe3;border-radius:8px;padding:6px 9px;font:13px/1.4 inherit;background:#fff;color:#1f2933}
+        .tablewrap{overflow-x:auto;margin-top:10px}
+        table{width:100%;border-collapse:collapse;font-size:12.5px}
+        th{text-align:left;padding:7px 8px;background:#f1f5f9;color:#475569;font-weight:600;white-space:nowrap}
+        td{padding:8px;border-bottom:1px solid #eef2f6;vertical-align:top;word-break:break-word}
+        tr.ok td{background:#f4fdf6}tr.manual td{background:#fffaf0}tr.bad td{background:#fef6f6}
+        .actions{white-space:normal}
+        .actions .btn{margin:2px 3px 2px 0}
+        .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11.5px;background:#eef2f6;color:#475569;white-space:nowrap}
+        .pill.ok{background:#dcfce7;color:#166534}.pill.warn{background:#ffedd5;color:#9a3412}.pill.bad{background:#fee2e2;color:#991b1b}.pill.busy{background:#dbeafe;color:#1e40af}
+        .tech{margin-top:8px;font-size:12px}
+        .tech>summary{cursor:pointer;color:#94a3b8}
+        .mono{margin-top:5px;font:11.5px/1.5 Consolas,Menlo,monospace;color:#64748b;white-space:pre-wrap;word-break:break-all;background:#f8fafc;border-radius:7px;padding:8px;max-height:150px;overflow:auto}
+        .statusbar{border-top:1px solid #eef2f6;padding:10px 16px;background:#fbfcfd}
+        .status{font-size:13px;color:#475569;white-space:pre-wrap}
+        .status.error{color:#b91c1c}.status.warning{color:#b45309}
+        .banner{display:flex;align-items:center;gap:12px;border:1px solid #fdba74;background:#fff8f1;border-radius:12px;padding:12px 14px;margin-bottom:14px}
+        .banner .sp{flex:1}
+        .modal{position:fixed;inset:0;z-index:2147483647;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;padding:20px}
+        .sheet{width:440px;max-width:100%;background:#fff;border-radius:14px;padding:22px;box-shadow:0 24px 60px rgba(15,23,42,.35)}
+        .sheet .mt{font-size:17px;font-weight:600;margin-bottom:8px}
+        .sheet .mx{color:#475569;margin-bottom:20px}
+        .sheet .mb{display:flex;justify-content:flex-end;gap:10px}
+        .sink{position:absolute;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none}
+        [hidden]{display:none !important}
       </style>
-      <section class="panel"><div class="head"><strong>批量串行自动填写保存</strong><small>v${SCRIPT_VERSION}</small></div><div class="body">
-        <div class="notice">严格串行：当前订单明确保存成功后保留页签；等待网站稳定并出现唯一创建入口后，才会创建下一订单。</div>
-        <div class="row"><input id="file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"></div>
-        <label class="row"><input id="authorize" type="checkbox"> 我确认本批订单已经人工核对，并授权脚本真实保存</label>
-        <div class="row"><button id="start" class="primary">开始</button><button id="pause">暂停</button><button id="resume">继续</button><button id="stop" class="danger">停止</button><button id="export">导出脱敏报告</button><button id="diagnostic">导出诊断JSON</button></div>
-        <div class="row"><button id="unlock">解除所列重复保护</button><button id="discard" class="danger">放弃中断批次</button><button id="newBatch">新批次</button><select id="filter"><option value="all">全部状态</option><option value="manual">仅人工项</option><option value="failed">仅异常</option><option value="saved">仅已保存</option></select></div>
-        <div id="status" class="status">请选择 Excel。</div><div id="stats" class="stats"></div>
-        <table><thead><tr><th style="width:19%">记录</th><th style="width:16%">状态</th><th style="width:24%">说明</th><th style="width:41%">操作</th></tr></thead><tbody id="rows"></tbody></table>
-        <details><summary>导入和结构问题</summary><div id="errors" class="errors">无</div></details>
-      </div></section>`;
+      <button class="orb" id="orb" type="button" title="批量开单助手">
+        <svg viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h10"/></svg><span class="badge" id="orbBadge" hidden></span>
+      </button>
+      <section class="win" id="win" hidden>
+        <header class="bar" id="bar"><b>批量开单助手</b><button class="ver" id="ver" type="button">v${SCRIPT_VERSION}</button><span class="sp"></span><button class="iconbtn" id="btnMin" type="button">收起</button></header>
+        <div class="scroll">
+          <div class="banner" id="recoverBar" hidden>
+            <div><b>上次还有没做完的批次</b><div class="sub">没保存过的订单已重新排队；处理完标橙的订单后，点「继续」接着做。</div></div>
+            <span class="sp"></span><button class="btn danger" id="discard" type="button">清除未完成记录</button>
+          </div>
+          <div class="stage" id="stageIdle">
+            <div class="drop" id="drop"><div class="plus">+</div><div class="big">把 Excel 拖到这里</div><div class="sub">或者点一下，选择要处理的表格（.xlsx，一次 1–100 条订单）</div></div>
+          </div>
+          <div class="stage" id="stageReady" hidden>
+            <div class="card">
+              <div class="filerow"><span class="ico">📄</span><div><div class="name" id="readyName"></div><div class="sub" id="readyCount"></div></div><span class="sp"></span><button class="btn tiny" id="btnRepick" type="button">换一个文件</button></div>
+              <div class="preview" id="readyPreview"></div>
+            </div>
+            <div class="cta"><button class="btn primary big" id="btnGo" type="button">开始处理</button><span class="sub">点击后脚本会在网站上真实创建并保存这些订单</span></div>
+          </div>
+          <div class="stage" id="stageInvalid" hidden>
+            <div class="card bad"><div class="ctitle" id="invalidTitle">这份表格需要先改一下</div><ul class="issues" id="invalidList"></ul></div>
+            <div class="cta"><button class="btn primary" id="btnRepick2" type="button">重新选择文件</button><button class="btn danger" id="unlock" type="button">这些订单确实要重做</button></div>
+          </div>
+          <div class="stage" id="stageRunning" hidden>
+            <div class="card">
+              <div class="progtop"><b id="runTitle">正在处理</b><span class="sub" id="runCount"></span></div>
+              <div class="track"><div class="fill" id="runFill" style="width:0%"></div></div>
+              <div class="sub" id="runDetail" style="margin-top:9px"></div>
+            </div>
+            <div class="cta"><button class="btn" id="pause" type="button">暂停</button><button class="btn primary" id="btnResume" type="button">继续</button><button class="btn danger" id="stop" type="button">停止</button></div>
+          </div>
+          <div class="stage" id="stageManual" hidden>
+            <div class="card warn">
+              <div class="ctitle" id="manualTitle"></div>
+              <div class="ctext" id="manualHint"></div>
+              <div class="who" id="manualWho"></div>
+              <div class="cta" id="manualActions"></div>
+              <details class="tech" id="manualTech" hidden><summary>技术详情</summary><div class="mono" id="manualRaw"></div></details>
+            </div>
+            <div class="sub" id="manualRest" style="margin-top:10px"></div>
+          </div>
+          <div class="stage" id="stageDone" hidden>
+            <div class="card ok"><div class="ctitle" id="doneTitle"></div><div class="ctext" id="doneText"></div></div>
+            <div class="cta"><button class="btn primary" id="export" type="button">导出报告</button><button class="btn" id="newBatch" type="button">新建一批</button></div>
+          </div>
+          <details class="detail" id="detail">
+            <summary><span>订单明细</span><span class="sub" id="detailHint"></span></summary>
+            <div class="inner">
+              <div class="tools">
+                <select id="filter"><option value="all">全部状态</option><option value="manual">仅人工项</option><option value="failed">仅异常</option><option value="saved">仅已保存</option></select>
+                <span class="sp"></span>
+                <button class="btn tiny" id="btnExport2" type="button">导出报告</button>
+                <button class="btn tiny" id="diagnostic" type="button" hidden>导出诊断JSON</button>
+              </div>
+              <div class="stats" id="stats"></div>
+              <div class="tablewrap"><table><thead><tr><th>订单</th><th>状态</th><th>说明</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table></div>
+              <div id="rawbox" hidden><div class="sub" style="margin-top:10px">原始信息</div><div class="mono" id="errors">无</div></div>
+            </div>
+          </details>
+        </div>
+        <div class="statusbar"><div id="status" class="status">请选择要处理的 Excel 表格。</div><div class="mono" id="statusRaw" hidden></div></div>
+      </section>
+      <div class="modal" id="modal" hidden><div class="sheet"><div class="mt" id="modalTitle"></div><div class="mx" id="modalText"></div><div class="mb"><button class="btn" id="modalCancel" type="button">取消</button><button class="btn primary" id="modalOk" type="button">确认</button></div></div></div>
+      <div class="sink"><input id="file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"><input id="authorize" type="checkbox"><button id="start" type="button"></button><button id="resume" type="button"></button></div>`;
   }
 
   function detectConflictingScript() {
@@ -576,7 +901,7 @@
     if (state.running || state.batchStarted || state.importErrors.length || !state.tasks.length) return;
     if (!state.authorization) { setStatus("请先确认已核对订单并授权真实保存。", "error"); return; }
     if (detectConflictingScript()) { setStatus("检测到其他测试脚本，请只启用正式版并刷新。", "error"); return; }
-    state.batchStarted = true; state.baselineTabs = new Set(listTabElements()); state.pauseRequested = false; state.stopRequested = false;
+    state.batchStarted = true; state.baselineTabs = new WeakSet(listTabElements()); state.pauseRequested = false; state.stopRequested = false;
     persistCheckpoint(); await runScheduler();
   }
 
@@ -625,15 +950,15 @@
       if (state.pauseRequested || state.stopRequested) return transitionTask(task, "manual_pending", "批次在保存前被暂停或停止");
       await saveSingleTask(task);
     } catch (error) {
-      if (error.createGate) {
-        task.error = errorMessage(error); task.errorCode = error.code || "create_entry_error";
+      if (error?.createGate) {
+        task.error = errorMessage(error); task.errorCode = error?.code || "create_entry_error";
         transitionTask(task, "create_entry_blocked", task.error);
-      } else if (error.orderNumber) {
-        task.error = errorMessage(error); task.errorCode = error.code || "order_number_error";
+      } else if (error?.orderNumber) {
+        task.error = errorMessage(error); task.errorCode = error?.code || "order_number_error";
         transitionTask(task, "order_number_blocked", task.error);
       } else {
         failTask(task, error);
-        if (error.fatal) state.globalHalt = errorMessage(error);
+        if (error?.fatal) state.globalHalt = errorMessage(error);
       }
       pauseForTask(task);
     }
@@ -660,7 +985,7 @@
     await waitForPostSaveCooldown(task);
     transitionTask(task, "waiting_create_entry", "等待网站保存后页面稳定和创建入口就绪");
     const beforeTabs = new Set(listTabElements()); const previous = getActiveTab();
-    const action = await waitForStableCreateOrderAction(15000, 500);
+    const action = await waitForStableCreateOrderAction(CREATE_ENTRY_TIMEOUT_MS, 500);
     recordDiagnostic("create_entry_stable", { source: locateCreateOrderAction().source || "", prior_tab_count: beforeTabs.size }, task.id);
     task.creationAttempted = true; persistCheckpoint();
     recordDiagnostic("create_click_dispatch", { prior_tab_count: beforeTabs.size }, task.id);
@@ -669,7 +994,7 @@
       await waitFor(() => {
         const active = getActiveTab(); const visibleSender = visiblePathElements("cor_name");
         return visibleSender.length === 1 && ((active && !beforeTabs.has(active)) || (previous && active && active !== previous) || listTabElements().some((tab) => !beforeTabs.has(tab)));
-      }, 15000, "点击创建运单后未观察到唯一新页签和表单");
+      }, CREATE_RESULT_TIMEOUT_MS, "点击创建运单后未观察到唯一新页签和表单");
     } catch (error) {
       throw createGateError("create_result_unobserved", `${errorMessage(error)}；为避免重复创建，脚本不会自动再次点击`);
     }
@@ -749,7 +1074,7 @@
     for (const tab of tabs) {
       const wasActive = tab === original;
       dispatchUserLikeClick(tab);
-      await waitFor(() => getActiveTab() === tab && visiblePathElements("cor_name").length === 1, 5000, "检查已有开单页签时切换超时");
+      await waitFor(() => getActiveTab() === tab && visiblePathElements("cor_name").length === 1, TAB_SWITCH_TIMEOUT_MS, "检查已有开单页签时切换超时");
       await sleep(220);
       const root = inferFormRoot(findUniqueVisiblePath("cor_name"));
       records.push({ tab, root, wasActive, empty: Boolean(root && isDraftEmpty(root)), orderNumber: root ? safelyReadOrderNumber(root) : "" });
@@ -760,7 +1085,7 @@
   async function activateInspectedDraft(record) {
     if (!record.tab?.isConnected || !record.root?.isConnected) throw orderNumberError("draft_removed", "待使用的空白开单页签已被移除");
     dispatchUserLikeClick(record.tab);
-    await waitFor(() => getActiveTab() === record.tab && isFormRootActive(record.root), 5000, "激活保留的空白开单页签超时");
+    await waitFor(() => getActiveTab() === record.tab && isFormRootActive(record.root), TAB_SWITCH_TIMEOUT_MS, "激活保留的空白开单页签超时");
     await sleep(220);
   }
 
@@ -773,7 +1098,7 @@
     const close = findTabCloseControl(record.tab);
     if (!close) throw orderNumberError("duplicate_close_missing", "同号空白页签未找到关闭按钮，未继续执行");
     dispatchUserLikeClick(close);
-    await waitFor(() => !record.tab.isConnected || !record.root.isConnected, 4000, "关闭同号空白页签后未观察到 DOM 移除");
+    await waitFor(() => !record.tab.isConnected || !record.root.isConnected, TAB_CLOSE_TIMEOUT_MS, "关闭同号空白页签后未观察到 DOM 移除");
   }
 
   function isDraftEmpty(root) {
@@ -911,7 +1236,7 @@
         const actual = readControl(uniqueControlInTask(task, mapping.dataPath));
         const matches = mapping.kind === "number" && !isBlank(expected) ? Number(actual) === Number(expected) : normalizeText(actual) === normalizeText(isBlank(expected) ? "" : expected);
         if (!matches) throw new Error("写入后回读不一致"); result.status = "verified";
-      } catch (error) { result.status = "failed"; result.error = errorMessage(error); if (error.fatal) result.fatal = true; }
+      } catch (error) { result.status = "failed"; result.error = errorMessage(error); if (error?.fatal) result.fatal = true; }
     }
     task.fields = mergeFields(task.fields, fields);
     const fatal = fields.find((item) => item.fatal);
@@ -932,7 +1257,7 @@
         if (control.getAttribute("data-is-select") !== "1") throw new Error("网站未确认下拉选择");
         if (!normalizeText(readControl(control) || control.title).includes(normalizeText(expected))) throw new Error("选择后回读不一致");
         result.status = "verified";
-      } catch (error) { result.status = "failed"; result.error = errorMessage(error); result.fatal = Boolean(error.fatal); break; }
+      } catch (error) { result.status = "failed"; result.error = errorMessage(error); result.fatal = Boolean(error?.fatal); break; }
     }
     task.fields = mergeFields(task.fields, fields);
     const failure = fields.find((item) => item.status !== "verified");
@@ -943,7 +1268,7 @@
   async function fillScopedAutocomplete(control, value, task) {
     let attemptStartedAt = performance.now();
     let before = await resetAndEnterAutocompleteQuery(control, value, task);
-    let selected = await chooseNewExactOption(value, before, 2400, control, task, { recordTimeout: false, attemptStartedAt });
+    let selected = await chooseNewExactOption(value, before, DATALIST_FIRST_POLL_MS, control, task, { recordTimeout: false, attemptStartedAt });
     if (!selected) {
       recordDiagnostic("candidate_retry", {
         field: control.getAttribute("data-path") || "", reason: "response_not_rendered_or_not_visible",
@@ -951,10 +1276,10 @@
       }, task?.id || "");
       attemptStartedAt = performance.now();
       before = await resetAndEnterAutocompleteQuery(control, value, task, { incremental: true });
-      selected = await chooseNewExactOption(value, before, 4500, control, task, { attemptStartedAt });
+      selected = await chooseNewExactOption(value, before, DATALIST_RETRY_POLL_MS, control, task, { attemptStartedAt });
     }
     if (!selected) throw new Error(`未找到唯一候选：${value}`);
-    await waitFor(() => control.getAttribute("data-is-select") === "1" && normalizeText(readControl(control) || control.title) === normalizeText(value), 3500, `候选点击后网站未确认：${value}`);
+    await waitFor(() => control.getAttribute("data-is-select") === "1" && normalizeText(readControl(control) || control.title) === normalizeText(value), DATALIST_CONFIRM_TIMEOUT_MS, `候选点击后网站未确认：${value}`);
   }
 
   async function resetAndEnterAutocompleteQuery(control, value, task, options = {}) {
@@ -999,7 +1324,7 @@
   async function chooseScopedValue(control, value, task) {
     let before = new Set([...document.body.querySelectorAll("*")].filter(isVisible));
     await activelyOpenDropdown(control, task, "select_initial", { force: true, expectedValue: value });
-    let selected = await chooseNewExactOption(value, before, 1800, control, task, { recordTimeout: false });
+    let selected = await chooseNewExactOption(value, before, SELECT_FIRST_POLL_MS, control, task, { recordTimeout: false });
     if (!selected) {
       recordDiagnostic("choice_retry", {
         field: control.getAttribute("data-path") || "", reason: "dropdown_not_rendered_or_not_visible",
@@ -1008,10 +1333,10 @@
       control.blur(); await sleep(180);
       before = new Set([...document.body.querySelectorAll("*")].filter(isVisible));
       await activelyOpenDropdown(control, task, "select_retry", { force: true, expectedValue: value });
-      selected = await chooseNewExactOption(value, before, 3500, control, task);
+      selected = await chooseNewExactOption(value, before, SELECT_RETRY_POLL_MS, control, task);
     }
     if (!selected) throw new Error(`未找到唯一选项：${value}`);
-    await waitFor(() => control.getAttribute("data-is-select") === "1" && normalizeText(readControl(control) || control.title).includes(normalizeText(value)), 3000, `选项点击后网站未确认：${value}`);
+    await waitFor(() => control.getAttribute("data-is-select") === "1" && normalizeText(readControl(control) || control.title).includes(normalizeText(value)), SELECT_CONFIRM_TIMEOUT_MS, `选项点击后网站未确认：${value}`);
   }
 
   async function chooseNewExactOption(value, visibleBefore, timeoutMs, control, task, options = {}) {
@@ -1177,7 +1502,7 @@
         const matches = mapping.kind === "number" && !isBlank(expected) ? Number(actual) === Number(expected) : normalizeText(actual).includes(normalizeText(isBlank(expected) ? "" : expected));
         result.status = selected && matches ? "verified" : "failed";
         if (result.status === "failed") result.error = "回读或下拉确认不一致";
-      } catch (error) { result.status = "failed"; result.error = errorMessage(error); result.fatal = Boolean(error.fatal); }
+      } catch (error) { result.status = "failed"; result.error = errorMessage(error); result.fatal = Boolean(error?.fatal); }
       return result;
     });
   }
@@ -1192,7 +1517,7 @@
       transitionTask(task, "saving");
       task.attempts += 1;
       const created = triggerObservedSave(task, options.reason || "initial", Boolean(options.continueOnly));
-      await waitForPermitRequest(created, 5000);
+      await waitForPermitRequest(created, SAVE_REQUEST_SEEN_TIMEOUT_MS);
       return created;
     });
     applySaveResult(task, await permit.resultPromise);
@@ -1283,14 +1608,14 @@
   }
 
   async function abandonTask(task) {
-    if (!window.confirm(`确认放弃订单 ${task.order.source_record_id}？该订单不会由脚本保存。`)) return;
+    if (!(await uiConfirm(`放弃订单 ${task.order.source_record_id}？脚本不会再保存这一单。`, { title: "放弃这一单？", okText: "放弃这一单", danger: true }))) return;
     const closed = await withOperationLock(() => closeOwnedTab(task, true));
     if (closed) { transitionTask(task, "abandoned", "用户明确放弃并已关闭页签"); task.completedAt = now(); }
     else transitionTask(task, "abandon_pending_close", "放弃已确认，但页签关闭失败；请人工关闭后确认");
   }
 
   async function confirmAmbiguousSaved(task) {
-    if (!window.confirm(`请确认你已在订单列表查到 ${task.order.source_record_id} 对应订单。确认后将按已保存处理，不能自动重试。`)) return;
+    if (!(await uiConfirm(`请先在网站的订单列表里确认 ${task.order.source_record_id} 已经生成。确认之后这一单会按「已保存」处理，不能再自动重试。`, { title: "确认已经保存了？", okText: "确认，已经保存了" }))) return;
     markTaskSavedRetained(task, "用户已在订单列表确认保存；现有页签保持原状");
     try { addLedgerRecord(task); state.globalHalt = ""; }
     catch (error) {
@@ -1301,7 +1626,7 @@
   }
 
   async function confirmNotSaved(task) {
-    if (!window.confirm(`请确认你已查询订单列表、该订单没有生成，并已人工关闭或放弃旧表单页签。确认后允许重新排队：${task.order.source_record_id}`)) return;
+    if (!(await uiConfirm(`请先确认两件事：网站的订单列表里没有 ${task.order.source_record_id}，而且旧的表单页签已经手工关掉了。确认后这一单会重新排队。`, { title: "确认没有生成？", okText: "确认，重新来一次" }))) return;
     task.tab = null; task.root = null; task.ownedTab = false; task.orderNumber = ""; task.orderNumberSource = ""; task.fields = []; task.errorCode = ""; task.creationAttempted = false; task.save = { channel: "", http_status: "", errno: "", message: "", identity_fingerprint: "" };
     transitionTask(task, "pending", "已人工确认未生成，允许重试"); state.globalHalt = "";
   }
@@ -1326,7 +1651,7 @@
   async function confirmManuallyClosed(task) {
     if (task.state !== "abandon_pending_close") throw new Error("当前订单不在放弃待关闭状态");
     if (task.tab?.isConnected || task.root?.isConnected) throw new Error("仍检测到页签或表单存在，请先关闭后再确认");
-    if (!window.confirm(`确认 ${task.order.source_record_id} 的页签已经由你人工关闭？`)) return;
+    if (!(await uiConfirm(`确认 ${task.order.source_record_id} 的页签已经由你手工关掉了？`, { title: "确认已经关好？", okText: "确认，已关好" }))) return;
     task.tab = null; task.root = null; task.cleanup = "manually_confirmed_closed";
     if (task.errorCode === "close_error") task.errorCode = "";
     transitionTask(task, "abandoned", "用户放弃并确认页签已关闭");
@@ -1334,7 +1659,7 @@
 
   async function retryOrderCreation(task) {
     if (task.state !== "order_number_blocked") throw new Error("当前订单不是运单号门禁拦截状态");
-    if (!window.confirm(`将关闭 ${task.order.source_record_id} 当前未保存页签并重新创建，是否继续？`)) return;
+    if (!(await uiConfirm(`会先关掉 ${task.order.source_record_id} 当前这个没保存的页签，然后重新开一单。要继续吗？`, { title: "关掉重新开一单？", okText: "继续" }))) return;
     const closed = await withOperationLock(() => closeOwnedTab(task, true));
     if (!closed) throw new Error("当前页签关闭失败，不能重新创建");
     task.orderNumber = ""; task.orderNumberSource = ""; task.fields = []; task.errorCode = ""; task.creationAttempted = false;
@@ -1350,7 +1675,7 @@
     const close = findTabCloseControl(task.tab);
     if (!close) return noteCloseFailure(task, "未找到页签关闭控件");
     dispatchUserLikeClick(close);
-    try { await waitFor(() => !task.tab.isConnected || !task.root?.isConnected, 4000, "关闭页签后未观察到页签移除"); }
+    try { await waitFor(() => !task.tab.isConnected || !task.root?.isConnected, TAB_CLOSE_TIMEOUT_MS, "关闭页签后未观察到页签移除"); }
     catch (error) { return noteCloseFailure(task, errorMessage(error)); }
     task.cleanup = "closed"; task.tab = null; task.root = null; return true;
   }
@@ -1388,7 +1713,7 @@
   }
 
   function failTask(task, error) {
-    task.error = errorMessage(error); task.errorCode = error.fatal ? "structure_error" : "mapping_error"; task.state = "mapping_failed"; state.pauseRequested = true; persistCheckpoint();
+    task.error = errorMessage(error); task.errorCode = error?.fatal ? "structure_error" : "mapping_error"; task.state = "mapping_failed"; state.pauseRequested = true; persistCheckpoint();
   }
 
   function maybeAutoResume() {
@@ -1428,7 +1753,13 @@
       })),
     };
     try { localStorage.setItem(CHECKPOINT_KEY, JSON.stringify(snapshot)); }
-    catch (error) { state.globalHalt = `无法写入中断检查点：${errorMessage(error)}`; }
+    catch {
+      // 空间不足时裁剪诊断事件重试一次；仍失败才停批（原有行为）。
+      try {
+        snapshot.diagnostics = { ...state.diagnostics, events: state.diagnostics.events.slice(-50) };
+        localStorage.setItem(CHECKPOINT_KEY, JSON.stringify(snapshot));
+      } catch (error) { state.globalHalt = `无法写入中断检查点：${errorMessage(error)}`; }
+    }
   }
 
   function restoreCheckpoint() {
@@ -1453,6 +1784,11 @@
       const task = { ...createTask(saved.order, index), ...saved, tab: null, root: null, ownedTab: false };
       if (task.state === "saved_pending_close") {
         task.state = "saved"; task.cleanup = "retained"; task.error = "旧版已明确保存记录已迁移为成功页签保留"; task.completedAt ||= now();
+      } else if (PRE_SAVE_STATES.has(task.state)) {
+        task.state = "pending"; task.error = ""; task.errorCode = ""; task.fields = [];
+        task.orderNumber = ""; task.orderNumberSource = "";
+        task.save = { channel: "", http_status: "", errno: "", message: "", identity_fingerprint: "" };
+        task.creationAttempted = true; // 重跑前先走既有的开单页签预检，拦住网站未清理的遗留草稿
       } else if (!TERMINAL_STATES.has(task.state) && task.state !== "pending" && task.state !== "abandon_pending_close") {
         task.state = task.state === "saving" || task.state === "save_ambiguous" ? "save_ambiguous" : "interrupted_manual";
         task.error = task.state === "save_ambiguous" ? "运行中断时订单可能正在保存，必须查询订单列表" : "页面中断后原页签无法安全自动重绑，请确认旧表单状态";
@@ -1470,7 +1806,9 @@
       localStorage.removeItem(PREVIOUS_SERIAL_CHECKPOINT_KEY);
       persistCheckpoint();
     }
-    setStatus("检测到未完成检查点。脚本不会自动恢复，请先处理标记为中断或结果不确定的订单。", "warning");
+    const requeued = state.tasks.filter((task) => task.state === "pending").length;
+    const manualLeft = state.tasks.filter((task) => MANUAL_STATES.has(task.state)).length;
+    setStatus(`检测到未完成检查点。未保存过的订单已重新排队（${requeued} 条）${manualLeft ? `；仍有 ${manualLeft} 条需先人工核对` : "，点「继续」即可接着做"}。`, "warning");
   }
 
   function loadLedger() {
@@ -1487,12 +1825,13 @@
     }; saveLedger(ledger);
   }
 
-  function unlockDuplicates() {
+  async function unlockDuplicates() {
     if (!state.duplicateKeys.length || !state.parsedImport) return;
-    if (!window.confirm(`确认解除当前文件中 ${state.duplicateKeys.length} 条记录的本地重复保护？这可能创建重复订单。`)) return;
+    if (!(await uiConfirm(`这份表格里有 ${state.duplicateKeys.length} 条以前已经成功开过了。继续的话可能在网站上开出重复的订单。确定要继续吗？`, { title: "确定要重做这些订单？", okText: "确定，继续", danger: true }))) return;
     const ledger = loadLedger();
     for (const key of state.duplicateKeys) delete ledger.records[key];
-    saveLedger(ledger);
+    try { saveLedger(ledger); }
+    catch (error) { setStatus(`解除防重复记录失败：${errorMessage(error)}`, "error"); return; }
     try {
       const legacy = JSON.parse(localStorage.getItem(LEGACY_LEDGER_KEY) || "null");
       if (legacy?.version === 1 && legacy.records) {
@@ -1508,15 +1847,16 @@
     Object.assign(state, {
       tasks: [], parsedImport: null, importErrors: [], duplicateKeys: [], fileName: "", batchId: "",
       running: false, batchStarted: false, pauseRequested: false, stopRequested: false, globalHalt: "",
-      authorization: false, safetyBlocks: 0, savePermit: null, clickPermitId: "", baselineTabs: new Set(),
+      authorization: false, safetyBlocks: 0, savePermit: null, clickPermitId: "", baselineTabs: new WeakSet(),
       recovered: false, legacyCheckpoint: false, completed: false, reportExported: false,
       diagnostics: { session_id: stableHash(`${Date.now()}-${Math.random()}`), started_at: now(), bridge_ready: state.diagnostics.bridge_ready, events: [] },
     });
     state.ui.file.value = ""; state.ui.authorize.checked = false; setStatus("请选择 Excel。"); renderSummary();
   }
 
-  function discardRecoveredBatch() {
-    if (!state.recovered || !window.confirm("确认删除中断检查点？脚本不会关闭或保存网站中遗留的页签，请先人工处理。")) return;
+  async function discardRecoveredBatch() {
+    if (!state.recovered) return;
+    if (!(await uiConfirm("清除之后，上次没做完的记录就找不回来了。网站上遗留的页签脚本不会帮你关，请先手工处理好。", { title: "清除未完成记录？", okText: "确认清除", danger: true }))) return;
     localStorage.removeItem(CHECKPOINT_KEY); localStorage.removeItem(PREVIOUS_SERIAL_CHECKPOINT_KEY); localStorage.removeItem(LEGACY_CHECKPOINT_KEY); state.completed = true; state.recovered = false; state.legacyCheckpoint = false; setStatus("中断检查点已删除。网站遗留页签仍需人工处理。", "warning"); renderSummary();
   }
 
@@ -1533,7 +1873,7 @@
       already_active: alreadyActive, click_dispatched: !alreadyActive,
       active_data_path: document.activeElement?.getAttribute?.("data-path") || "", dropdown_menu_visible: dropdownMenuState().visible,
     }, task.id);
-    try { await waitFor(() => getActiveTab() === task.tab || isFormRootActive(task.root), 5000, "切换订单页签超时"); }
+    try { await waitFor(() => getActiveTab() === task.tab || isFormRootActive(task.root), TAB_SWITCH_TIMEOUT_MS, "切换订单页签超时"); }
     catch (error) {
       if (!task.tab?.isConnected || !task.root?.isConnected) rebound = await rebindTaskContext(task, "切换过程中页签或表单DOM被网站替换");
       else throw error;
@@ -1546,7 +1886,7 @@
   async function rebindTaskContext(task, reason) {
     const oldTabConnected = Boolean(task.tab?.isConnected); const oldRootConnected = Boolean(task.root?.isConnected);
     if (oldTabConnected) dispatchUserLikeClick(task.tab);
-    const deadline = Date.now() + 8000; let stableTab = null; let stableRoot = null; let stableSince = 0;
+    const deadline = Date.now() + REBIND_TIMEOUT_MS; let stableTab = null; let stableRoot = null; let stableSince = 0;
     while (Date.now() < deadline) {
       const tab = getActiveTab(); const sender = findUniqueVisiblePath("cor_name"); const root = inferFormRoot(sender);
       let number = ""; try { number = root ? readOrderNumber(root).value : ""; } catch { /* wait for final form */ }
@@ -1749,13 +2089,19 @@
       const key = normalizeZipPath(name);
       const entry = this.entries.get(key);
       if (!entry) throw new Error(`XLSX 缺少文件：${key}`);
-      const view = new DataView(this.bytes.buffer, this.bytes.byteOffset, this.bytes.byteLength);
-      const local = entry.localOffset;
-      if (view.getUint32(local, true) !== 0x04034b50) throw new Error(`ZIP 本地文件头损坏：${key}`);
-      const nameLength = view.getUint16(local + 26, true);
-      const extraLength = view.getUint16(local + 28, true);
-      const start = local + 30 + nameLength + extraLength;
-      const compressed = this.bytes.slice(start, start + entry.compressedSize);
+      let compressed;
+      try {
+        const view = new DataView(this.bytes.buffer, this.bytes.byteOffset, this.bytes.byteLength);
+        const local = entry.localOffset;
+        if (view.getUint32(local, true) !== 0x04034b50) throw new Error(`ZIP 本地文件头损坏：${key}`);
+        const nameLength = view.getUint16(local + 26, true);
+        const extraLength = view.getUint16(local + 28, true);
+        const start = local + 30 + nameLength + extraLength;
+        compressed = this.bytes.slice(start, start + entry.compressedSize);
+      } catch (error) {
+        if (error instanceof RangeError) throw new Error(`不是有效的 XLSX/ZIP 文件或文件已损坏：${key}`);
+        throw error;
+      }
       if (entry.method === 0) return compressed;
       if (entry.method !== 8) throw new Error(`不支持的 ZIP 压缩方式 ${entry.method}：${key}`);
       if (typeof DecompressionStream !== "function") throw new Error("当前浏览器不支持本地 XLSX 解压，请使用最新版 Chrome/Edge");
@@ -1763,28 +2109,33 @@
       return new Uint8Array(await new Response(stream).arrayBuffer());
     }
     readDirectory() {
-      const view = new DataView(this.bytes.buffer, this.bytes.byteOffset, this.bytes.byteLength);
-      let eocd = -1;
-      for (let offset = this.bytes.length - 22; offset >= Math.max(0, this.bytes.length - 65557); offset -= 1) {
-        if (view.getUint32(offset, true) === 0x06054b50) { eocd = offset; break; }
+      try {
+        const view = new DataView(this.bytes.buffer, this.bytes.byteOffset, this.bytes.byteLength);
+        let eocd = -1;
+        for (let offset = this.bytes.length - 22; offset >= Math.max(0, this.bytes.length - 65557); offset -= 1) {
+          if (view.getUint32(offset, true) === 0x06054b50) { eocd = offset; break; }
+        }
+        if (eocd < 0) throw new Error("不是有效的 XLSX/ZIP 文件");
+        const count = view.getUint16(eocd + 10, true);
+        let offset = view.getUint32(eocd + 16, true);
+        const entries = new Map();
+        for (let index = 0; index < count; index += 1) {
+          if (view.getUint32(offset, true) !== 0x02014b50) throw new Error("ZIP 中央目录损坏");
+          const method = view.getUint16(offset + 10, true);
+          const compressedSize = view.getUint32(offset + 20, true);
+          const nameLength = view.getUint16(offset + 28, true);
+          const extraLength = view.getUint16(offset + 30, true);
+          const commentLength = view.getUint16(offset + 32, true);
+          const localOffset = view.getUint32(offset + 42, true);
+          const name = TEXT_DECODER.decode(this.bytes.slice(offset + 46, offset + 46 + nameLength));
+          entries.set(normalizeZipPath(name), { method, compressedSize, localOffset });
+          offset += 46 + nameLength + extraLength + commentLength;
+        }
+        return entries;
+      } catch (error) {
+        if (error instanceof RangeError) throw new Error("不是有效的 XLSX/ZIP 文件或文件已损坏");
+        throw error;
       }
-      if (eocd < 0) throw new Error("不是有效的 XLSX/ZIP 文件");
-      const count = view.getUint16(eocd + 10, true);
-      let offset = view.getUint32(eocd + 16, true);
-      const entries = new Map();
-      for (let index = 0; index < count; index += 1) {
-        if (view.getUint32(offset, true) !== 0x02014b50) throw new Error("ZIP 中央目录损坏");
-        const method = view.getUint16(offset + 10, true);
-        const compressedSize = view.getUint32(offset + 20, true);
-        const nameLength = view.getUint16(offset + 28, true);
-        const extraLength = view.getUint16(offset + 30, true);
-        const commentLength = view.getUint16(offset + 32, true);
-        const localOffset = view.getUint32(offset + 42, true);
-        const name = TEXT_DECODER.decode(this.bytes.slice(offset + 46, offset + 46 + nameLength));
-        entries.set(normalizeZipPath(name), { method, compressedSize, localOffset });
-        offset += 46 + nameLength + extraLength + commentLength;
-      }
-      return entries;
     }
   }
 
@@ -1811,6 +2162,147 @@
     return parts.join("/");
   }
 
+  // ——— 说人话的展示层 ———
+  // 这里只负责翻译，不改变任何判断。原始技术文本仍由 task.error / state.importErrors 保留，
+  // 并原样进入导出的报告；界面上把它折叠进「技术详情」。
+
+  const FIELD_LABEL = {
+    schema_version: "表格版本", batch_id: "批次号", source_record_id: "订单编号", source_label: "订单备注",
+    destination_text: "到站", delivery_type: "送货方式", sender_name: "发货人", receiver_name: "收货人",
+    receiver_mobile: "收货人电话", goods_name: "货物名称", package: "包装", quantity: "件数",
+    weight: "重量", volume: "体积", freight: "运费", payment_type: "付款方式",
+  };
+
+  const STAGE_TEXT = {
+    pending: "排队等待", creating: "正在准备开单页面", waiting_create_entry: "正在等网站的开单按钮",
+    direct_filling: "正在填写收发货信息", custom_pending: "正在切到这一单",
+    custom_filling: "正在选择到站和付款方式", verifying: "正在核对填写内容",
+    ready_to_save: "准备保存", saving: "正在保存",
+  };
+
+  const TROUBLE_BY_CODE = {
+    order_number_not_advanced: ["运单号没有往下走", "网站给出的新运单号和上一单相同或更小。为了不开重号，已经在填写前停下。请先到网站确认上一单是不是真的保存成功了。"],
+    order_number_not_unique: ["读不准这一单的单号", "页面上出现了多个单号，分不清是哪一个。请只留一个开单页签后重试。"],
+    order_number_root_missing: ["找不到开单表单", "当前页面上没有可用的开单表单。请回到开单页面后重试。"],
+    order_number_error: ["单号有点问题", "请在网站上确认这一单的状态，再选择下面的处理方式。"],
+    existing_draft_uninspectable: ["有个开单页签看不清内容", "脚本没法确认它是不是空白的。请手工把多余的开单页签关掉，只留一个干净的。"],
+    existing_draft_not_empty: ["已经打开的开单页签里有内容", "请先手工把它保存或关掉，再回来继续。"],
+    multiple_draft_numbers: ["打开了好几个开单页签", "请只保留一个空白的开单页签，其余关掉后重试。"],
+    kept_draft_changed: ["保留的开单页签被改动了", "请手工确认页面状态后重试。"],
+    existing_form_without_tab: ["页面状态不太对", "找到了开单表单，却没有对应的页签。请刷新页面后重新开始。"],
+    draft_removed: ["开单页签不见了", "网站把它关掉了。请确认页面状态后点「重新检查」。"],
+    duplicate_draft_changed: ["重复的页签里出现了内容", "请手工处理这些页签后重试。"],
+    duplicate_close_missing: ["关不掉重复的页签", "请手工把多余的空白开单页签关掉后重试。"],
+    create_entry_timeout: ["没等到「创建运单」按钮", "网站可能还在加载。确认页面正常后点「重新检查」。"],
+    create_entry_multiple: ["页面上有好几个创建入口", "请把多余的开单页签关掉，只留一个，再点「重新检查」。"],
+    create_result_unobserved: ["点了创建但没反应", "网站没有打开新的开单页签。请确认页面状态后重试。"],
+    create_bind_failed: ["新页签认不出来", "网站的开单页面和预期不一样。请刷新页面后重新开始。"],
+    create_bound_baseline: ["认到的是一个旧页签", "为了不写错单已经停下。请关掉多余页签后重试。"],
+    create_entry_error: ["创建下一单时出了问题", "请确认页面状态后点「重新检查」。"],
+    ledger_error: ["订单已保存，本机记录没写上", "这一单在网站上是成功的，只是本机的「防重复」记录没写进去。清理一下浏览器存储后点「重试记录」。"],
+    close_error: ["有个页签没能关掉", "请手工关闭这一单的页签，然后点「我已关好」。"],
+    structure_error: ["网站页面和脚本对不上", "网站可能改版了。请先停止批次，并把报告发给开发者。"],
+    mapping_error: ["这一单没能填完", "请在网站上手工把这一单补齐，然后点「我已改好，继续保存」。"],
+  };
+
+  const TROUBLE_BY_STATE = {
+    save_ambiguous: ["这一单结果不确定", "请到网站的订单列表里搜一下这条记录：找得到就点「已经保存了」，找不到就点「没有生成，重新来」。"],
+    decision_required: ["网站要你确认一下", "网站弹出了确认提示。核对没问题点「继续保存」，有疑问就点「放弃这一单」。"],
+    save_failed: ["这一单没保存成功", "请在网站里核对这一单，改好后点「我已改好，继续保存」。"],
+    mapping_failed: ["这一单没能填完", "请在网站上手工把它补齐，然后点「我已改好，继续保存」。"],
+    manual_pending: ["这一单等你处理", "请在网站上确认这一单的状态，再选择下面的处理方式。"],
+    interrupted_manual: ["刷新前这一单没走完", "请到网站订单列表核对：已经生成就点「已经保存了」，没生成就点「没有生成，重新来」。"],
+    order_number_blocked: ["单号有点问题", "请确认页面状态后，选择重新创建或者放弃这一单。"],
+    create_entry_blocked: ["创建下一单时停下了", "请确认页面状态后点「重新检查」。"],
+    abandon_pending_close: ["页签还没关掉", "请手工关闭这一单的页签，然后点「我已关好」。"],
+    legacy_checkpoint_blocked: ["有一批很旧的未完成记录", "请先在网站上手工处理遗留的页签，再点「清除未完成记录」。"],
+  };
+
+  const TROUBLE_FALLBACK = ["遇到了一个问题", "请展开「技术详情」看看，并把导出的报告发给开发者。"];
+
+  // 把某一单的当前情况翻译成「一句标题 + 一句怎么办」。任何时候都不会返回空。
+  function taskTrouble(task) {
+    return TROUBLE_BY_CODE[task.errorCode]
+      || TROUBLE_BY_STATE[task.state]
+      || (MANUAL_STATES.has(task.state) ? ["这一单需要你看一下", "请在网站里核对这一单，再选择下面的处理方式。"] : null)
+      || TROUBLE_FALLBACK;
+  }
+
+  function taskTone(task) {
+    if (task.state === "saved") return "ok";
+    if (task.state === "abandoned") return "bad";
+    if (MANUAL_STATES.has(task.state)) return "warn";
+    if (task.state === "pending") return "";
+    return "busy";
+  }
+
+  // 导入预检的报错原文是按英文列名写的，这里换成表格里看得懂的说法。
+  function plainIssue(text) {
+    let output = String(text || "");
+    if (/DecompressionStream|不支持本地 XLSX 解压/.test(output)) return "请改用最新版的 Chrome 或 Edge 浏览器。";
+    if (/ZIP|不是有效的 XLSX|XML 解析失败|工作表数据缺失/.test(output)) return "这个文件打不开，可能不是真正的 .xlsx，或者已经损坏。请重新导出一份。";
+    if (/工作簿缺少/.test(output)) return "这份表格里没有名为「导入数据」的工作表，请确认用的是标准模板。";
+    output = output.replace(/^缺少列：(\w+)$/, (_all, key) => `表格里少了「${FIELD_LABEL[key] || key}」这一列`);
+    output = output.replace(/^第 (\S+) 行[：]?\s*(\w+)?[：]?/, (_all, row, key) => (key ? `第 ${row} 行「${FIELD_LABEL[key] || key}」：` : `第 ${row} 行：`));
+    for (const [pattern, replacement] of [
+      [/不能为空$/, "没有填"],
+      [/必须为正整数$/, "要填大于 0 的整数"],
+      [/必须为空或非负数$/, "要么留空，要么填 0 或正数"],
+      [/必须为非负数且最多两位小数$/, "要填 0 或正数，最多两位小数"],
+      [/仅支持 delivery\/pickup$/, "只能填 delivery（送货）或 pickup（自提）"],
+      [/正式 v1\.0 仅支持 pay_billing$/, "目前只支持 pay_billing（月结）"],
+      [/必须为 v1\.0$/, "必须写 v1.0"],
+      [/不得用 (null|undefined) 表示空值$/, "不能写 null 或 undefined，留空就行"],
+      [/^(.*)：(\S+) 重复$/, "$1：$2 和别的行重复了"],
+      [/不允许公式单元格（(.+)）$/, "这些格子里是公式，请改成实际的值：$1"],
+      [/^同一文件中的 batch_id 必须一致$/, "同一份表格里的批次号必须完全一样"],
+      [/^导入数据中没有订单记录$/, "这份表格里没有订单数据"],
+      [/^每份 Excel 最多允许 (\d+) 条订单，当前为 (\d+) 条$/, "一次最多 $1 条订单，这份有 $2 条，请拆成几份"],
+      [/^本地防重复台账发现 (\d+) 条已保存记录，默认禁止再次运行$/, "其中 $1 条以前已经成功开过了，为了不重复下单先拦下来了"],
+    ]) output = output.replace(pattern, replacement);
+    // 收尾：把句子里剩下的英文列名（例如公式单元格列表）也换成表格里的中文列名。
+    output = output.replace(/[a-z_]{4,}/g, (word) => FIELD_LABEL[word] || word);
+    return output.replace(/<已脱敏>/g, "（内容已隐藏）").replace(/<手机号已脱敏>/g, "（手机号已隐藏）");
+  }
+
+  // 状态栏文案。原文保留在 #statusRaw 里，调试模式下可见。
+  const STATUS_RULES = [
+    [/^批次完成：保存 (\d+) 条，放弃 (\d+) 条/, "全部完成：成功 $1 条，放弃 $2 条。报告已经自动下载。"],
+    [/^预检通过：(\d+) 条订单/, "表格没问题，一共 $1 条订单，可以开始了。"],
+    [/^导入被阻断：发现 (\d+) 个问题/, "这份表格有 $1 处需要先改一下。"],
+    [/^Excel 解析失败/, "这个文件打不开。请确认是 .xlsx，而且没有加密或损坏。"],
+    [/^正在解析并预检/, "正在读取表格…"],
+    [/^仍有 (\d+) 条订单必须先人工处理/, "还有 $1 条要你先处理，处理完才能继续。"],
+    [/^自动队列已结束，仍有 (\d+) 条/, "自动部分跑完了，还有 $1 条要你确认。"],
+    [/^订单均已结束，但有 (\d+) 条防重复台账写入失败/, "订单都处理完了，但有 $1 条没记进本机的防重复清单。清理一下浏览器存储，再到明细里点「重试记录」。"],
+    [/^已阻止未授权保存操作/, "刚才有一次没经过确认的保存动作被挡下来了，数据是安全的。"],
+    [/^已自动关闭 (\d+) 个同运单号空白页签/, "顺手关掉了 $1 个重复的空白开单页签。"],
+    [/^检测到 v1\.0\.0 并行检查点|^旧并行检查点不能恢复/, "上次的记录太旧了，没法接着跑。请先在网站上处理掉遗留的页签，再点「清除未完成记录」。"],
+    [/^检测到未完成检查点。未保存过的订单已重新排队（(\d+) 条）；仍有 (\d+) 条/, "上次没做完的批次里，$1 条没保存过的订单已重新排队；还有 $2 条标橙的要先人工核对，处理完再点「继续」。"],
+    [/^检测到未完成检查点/, "上次还有没做完的批次。没保存过的订单已经重新排队，点「继续」就会接着做。"],
+    [/^解除防重复记录失败/, "没能解除防重复记录，可能是浏览器存储满了。清理浏览器存储后再试一次。"],
+    [/^页面已切到后台/, "页面切到后台了。请回到本页面并保持在前台，不然容易误判超时。"],
+    [/^中断检查点已删除/, "未完成记录已经清掉了。网站上遗留的页签还要你手工关一下。"],
+    [/^请先确认已核对订单|^恢复前请重新勾选/, "开始之前需要你先确认一次。"],
+    [/^检测到其他测试脚本|检测到旧测试脚本/, "还有别的测试脚本开着。请在油猴里只留这一个，然后刷新页面。"],
+    [/^页签关闭失败/, "有个页签没关掉，已经先停下了，不会往下开单。"],
+    [/^已请求暂停/, "正在暂停，这一单当前的动作做完就停。"],
+    [/^已请求停止/, "正在停止，不会再开始新的订单了。"],
+    [/^批次已暂停/, "已暂停。可以先处理需要人工的订单，或者点「继续」。"],
+    [/^批次已停止|^人工操作失败/, "出问题停下来了，请看上面这一单的说明。"],
+    [/^当前批次尚未完成/, "当前这一批还没做完，不能直接新建。"],
+    [/^请选择 Excel/, "请选择要处理的 Excel 表格。"],
+  ];
+
+  function plainStatus(text) {
+    const message = String(text || "");
+    for (const [pattern, replacement] of STATUS_RULES) {
+      const match = message.match(pattern);
+      if (match) return replacement.replace(/\$(\d)/g, (_all, index) => match[Number(index)] ?? "");
+    }
+    return message.replace(/<已脱敏>/g, "（内容已隐藏）").replace(/<手机号已脱敏>/g, "（手机号已隐藏）");
+  }
+
   function renderSummary() {
     if (!state.ui) return;
     const counts = {
@@ -1818,9 +2310,12 @@
       pending: state.tasks.filter((task) => task.state === "pending").length,
       manual: state.tasks.filter((task) => MANUAL_STATES.has(task.state)).length,
       failed: state.tasks.filter((task) => ["mapping_failed", "save_failed", "save_ambiguous"].includes(task.state)).length,
+      abandoned: state.tasks.filter((task) => task.state === "abandoned").length,
+      done: state.tasks.filter((task) => TERMINAL_STATES.has(task.state)).length,
     };
-    state.ui.stats.innerHTML = [["总数", state.tasks.length], ["已保存", counts.saved], ["待执行", counts.pending], ["人工项", counts.manual], ["保存拦截", state.safetyBlocks]]
-      .map(([label, value]) => `<div class="stat"><b>${value}</b>${label}</div>`).join("");
+    const tiles = [["总数", state.tasks.length], ["已完成", counts.saved], ["待处理", counts.pending], ["需人工", counts.manual]];
+    if (panel.debug || state.safetyBlocks) tiles.push(["已挡下的意外保存", state.safetyBlocks]);
+    state.ui.stats.innerHTML = tiles.map(([label, value]) => `<div class="stat"><b>${value}</b><span>${label}</span></div>`).join("");
     const filter = state.ui.filter.value;
     const visibleTasks = state.tasks.filter((task) => filter === "all"
       || filter === "manual" && MANUAL_STATES.has(task.state)
@@ -1828,8 +2323,8 @@
       || filter === "saved" && task.state === "saved");
     state.ui.rows.innerHTML = visibleTasks.map((task) => {
       const rowClass = task.state === "saved" ? "ok" : MANUAL_STATES.has(task.state) ? "manual" : task.state === "abandoned" ? "bad" : "";
-      return `<tr class="${rowClass}"><td>${escapeHtml(task.order.source_record_id)}</td><td>${escapeHtml(stateLabel(task.state))}</td><td>${escapeHtml(taskExplanation(task))}</td><td class="actions">${taskActions(task)}</td></tr>`;
-    }).join("") || `<tr><td colspan="4">暂无记录</td></tr>`;
+      return `<tr class="${rowClass}"><td>${escapeHtml(task.order.source_record_id)}</td><td><span class="pill ${taskTone(task)}">${escapeHtml(stateLabel(task.state))}</span></td><td>${taskExplanation(task)}</td><td class="actions">${taskActions(task)}</td></tr>`;
+    }).join("") || `<tr><td colspan="4">还没有订单</td></tr>`;
     state.ui.errors.textContent = state.importErrors.length ? state.importErrors.join("\n") : state.globalHalt || "无";
     state.ui.file.disabled = state.batchStarted;
     state.ui.authorize.disabled = state.running;
@@ -1841,50 +2336,130 @@
     state.ui.unlock.disabled = !state.duplicateKeys.length || state.batchStarted;
     state.ui.discard.disabled = !state.recovered || state.running;
     state.ui.newBatch.disabled = state.batchStarted && !state.completed;
+    renderShell(counts);
   }
 
-  function taskActions(task) {
-    if (task.state === "saved" && task.errorCode === "ledger_error") return actionButton(task, "retry-ledger", "重试防重复台账");
+  // 根据批次所处的阶段，只显示当前该看的那一块。
+  function renderShell(counts) {
+    const el = panel.el; if (!el.win) return;
+    const total = state.tasks.length;
+    const manualTask = state.tasks.find((task) => MANUAL_STATES.has(task.state)) || null;
+    let stage = "idle";
+    if (state.completed) stage = "done";
+    else if (state.batchStarted) stage = "running";
+    else if (state.importErrors.length) stage = "invalid";
+    else if (total) stage = "ready";
+
+    el.stageIdle.hidden = stage !== "idle";
+    el.stageReady.hidden = stage !== "ready";
+    el.stageInvalid.hidden = stage !== "invalid";
+    el.stageRunning.hidden = stage !== "running";
+    el.stageDone.hidden = stage !== "done";
+    el.stageManual.hidden = !(stage === "running" && manualTask);
+    el.recoverBar.hidden = !(state.recovered || state.legacyCheckpoint) || state.completed;
+
+    if (stage === "ready") {
+      el.readyName.textContent = state.fileName || "已选择的表格";
+      el.readyCount.textContent = `共 ${total} 条订单${state.batchId ? ` · 批次 ${state.batchId}` : ""}`;
+      el.readyPreview.innerHTML = state.tasks.slice(0, 3).map((task) => `<div>${escapeHtml(task.order.source_record_id)} · 到 ${escapeHtml(task.order.destination_text)} · ${escapeHtml(task.order.receiver_name)} · ${escapeHtml(task.order.goods_name)}</div>`).join("")
+        + (total > 3 ? `<div class="sub">…… 还有 ${total - 3} 条</div>` : "");
+    }
+    if (stage === "invalid") {
+      el.invalidTitle.textContent = state.importErrors.length > 1 ? `这份表格有 ${state.importErrors.length} 处需要先改一下` : "这份表格需要先改一下";
+      el.invalidList.innerHTML = state.importErrors.slice(0, 40).map((issue) => `<li>${escapeHtml(plainIssue(issue))}</li>`).join("")
+        + (state.importErrors.length > 40 ? `<li>…… 还有 ${state.importErrors.length - 40} 处</li>` : "");
+      state.ui.unlock.hidden = !state.duplicateKeys.length;
+    }
+    if (stage === "running") {
+      const active = state.tasks.find((task) => !TERMINAL_STATES.has(task.state) && task.state !== "pending") || null;
+      el.runTitle.textContent = state.running ? "正在处理" : state.stopRequested ? "已停止" : "已暂停";
+      el.runCount.textContent = `已完成 ${counts.done} / ${total} 条`;
+      el.runFill.style.width = `${total ? Math.round((counts.done / total) * 100) : 0}%`;
+      el.runDetail.textContent = active ? `${STAGE_TEXT[active.state] || stateLabel(active.state)} · 订单 ${active.order.source_record_id}` : state.running ? "正在准备下一单…" : "当前没有正在处理的订单。";
+      state.ui.pause.hidden = state.ui.pause.disabled;
+      state.ui.stop.hidden = state.ui.stop.disabled;
+      el.btnResume.hidden = !(state.batchStarted && !state.running && !state.completed);
+    }
+    if (stage === "running" && manualTask) {
+      const [title, hint] = taskTrouble(manualTask);
+      const missing = manualTask.fields.filter((field) => field.status !== "verified").map((field) => FIELD_LABEL[field.key] || field.key);
+      el.manualTitle.textContent = title;
+      el.manualHint.textContent = hint;
+      el.manualWho.innerHTML = `订单 <b>${escapeHtml(manualTask.order.source_record_id)}</b> · 到 ${escapeHtml(manualTask.order.destination_text)} · ${escapeHtml(manualTask.order.receiver_name)}`
+        + (missing.length ? `<br>对不上的项目：<b>${escapeHtml(missing.join("、"))}</b>` : "");
+      el.manualActions.innerHTML = taskActions(manualTask, "") || `<span class="sub">这一单已经没有可自动处理的动作了。</span>`;
+      el.manualTech.hidden = !panel.debug;
+      el.manualRaw.textContent = `${manualTask.state} / ${manualTask.errorCode || "-"}\n${sanitizeForReport(manualTask, manualTask.error || manualTask.save.message || "")}`;
+      const waiting = total - counts.done - 1;
+      el.manualRest.textContent = waiting > 0 ? `剩下的 ${waiting} 条要等这一条处理完才会继续。` : "";
+    }
+    if (stage === "done") {
+      el.doneTitle.textContent = counts.abandoned ? `做完了：成功 ${counts.saved} 条，放弃 ${counts.abandoned} 条` : `全部完成：成功 ${counts.saved} 条`;
+      el.doneText.textContent = "报告已经自动下载到你的下载文件夹。可以点「新建一批」处理下一份表格。";
+      if (!panel.doneShown) { panel.doneShown = true; setWindowOpen(true); }
+    }
+    if (!state.completed) panel.doneShown = false;
+
+    el.detail.hidden = !total;
+    el.detailHint.textContent = total ? `已完成 ${counts.done} · 待处理 ${total - counts.done}` : "";
+    state.ui.diagnostic.hidden = !panel.debug;
+    el.rawbox.hidden = !panel.debug;
+    el.statusRaw.hidden = !panel.debug;
+
+    const alert = counts.manual > 0 || Boolean(state.globalHalt);
+    el.orb.classList.toggle("alert", alert);
+    const badge = alert ? String(counts.manual || "!") : state.batchStarted && !state.completed ? `${counts.done}/${total}` : "";
+    el.orbBadge.textContent = badge; el.orbBadge.hidden = !badge;
+    reclampWindowPosition();
+  }
+
+  function taskActions(task, size = "tiny") {
+    if (task.state === "saved" && task.errorCode === "ledger_error") return actionButton(task, "retry-ledger", "重试记录", false, "", size);
     if (TERMINAL_STATES.has(task.state)) return "";
     const buttons = [];
-    if (task.tab?.isConnected) buttons.push(actionButton(task, "activate", "打开页签"));
+    if (task.tab?.isConnected) buttons.push(actionButton(task, "activate", "在网站上打开", false, "", size));
     if (task.state === "decision_required") {
-      buttons.push(actionButton(task, "continue-save", "继续保存"));
+      buttons.push(actionButton(task, "continue-save", "继续保存", false, "primary", size));
     }
-    if (["mapping_failed", "save_failed", "manual_pending"].includes(task.state) && task.tab?.isConnected) buttons.push(actionButton(task, "repair", "修正后验证保存"));
-    if (task.state === "order_number_blocked" && task.ownedTab) buttons.push(actionButton(task, "retry-order", "关闭并重新创建"));
-    if (task.state === "order_number_blocked" && !task.ownedTab) buttons.push(actionButton(task, "retry-preflight", "重新检查页面"));
-    if (task.state === "create_entry_blocked") buttons.push(actionButton(task, "retry-preflight", "重新检查并创建下一单"));
+    if (["mapping_failed", "save_failed", "manual_pending"].includes(task.state) && task.tab?.isConnected) buttons.push(actionButton(task, "repair", "我已改好，继续保存", false, "primary", size));
+    if (task.state === "order_number_blocked" && task.ownedTab) buttons.push(actionButton(task, "retry-order", "关掉重新开一单", false, "", size));
+    if (task.state === "order_number_blocked" && !task.ownedTab) buttons.push(actionButton(task, "retry-preflight", "重新检查", false, "", size));
+    if (task.state === "create_entry_blocked") buttons.push(actionButton(task, "retry-preflight", "重新检查", false, "primary", size));
     if (task.state === "abandon_pending_close") {
-      buttons.push(actionButton(task, "retry-close", "重试关闭"));
-      buttons.push(actionButton(task, "confirm-closed", "确认已人工关闭"));
+      buttons.push(actionButton(task, "retry-close", "再试着关一次", false, "", size));
+      buttons.push(actionButton(task, "confirm-closed", "我已关好", false, "primary", size));
     }
     if (["save_ambiguous", "interrupted_manual"].includes(task.state)) {
-      buttons.push(actionButton(task, "confirm-saved", "确认已保存"));
-      buttons.push(actionButton(task, "confirm-not-saved", "确认未生成并重排"));
+      buttons.push(actionButton(task, "confirm-saved", "已经保存了", false, "primary", size));
+      buttons.push(actionButton(task, "confirm-not-saved", "没有生成，重新来", false, "", size));
     }
-    if (MANUAL_STATES.has(task.state) && task.ownedTab && task.tab?.isConnected && !["abandon_pending_close", "save_ambiguous", "interrupted_manual", "legacy_checkpoint_blocked"].includes(task.state)) buttons.push(actionButton(task, "abandon", "放弃本单", false, "danger"));
+    if (MANUAL_STATES.has(task.state) && task.ownedTab && task.tab?.isConnected && !["abandon_pending_close", "save_ambiguous", "interrupted_manual", "legacy_checkpoint_blocked"].includes(task.state)) buttons.push(actionButton(task, "abandon", "放弃这一单", false, "danger", size));
     return buttons.join("");
   }
 
-  function actionButton(task, action, label, disabled = false, className = "") {
-    return `<button data-action="${action}" data-task="${escapeHtml(task.id)}" class="${className}" ${disabled ? "disabled" : ""}>${escapeHtml(label)}</button>`;
+  function actionButton(task, action, label, disabled = false, className = "", size = "tiny") {
+    return `<button type="button" data-action="${action}" data-task="${escapeHtml(task.id)}" class="btn ${size} ${className}" ${disabled ? "disabled" : ""}>${escapeHtml(label)}</button>`;
   }
 
   function stateLabel(value) {
     return ({
-      pending: "待处理", creating: "检查空白页签", waiting_create_entry: "等待创建入口", direct_filling: "普通字段填写", custom_pending: "等待活动页签", custom_filling: "自定义字段填写",
-      verifying: "回读验证", ready_to_save: "待保存", saving: "保存中", saved: "保存成功", mapping_failed: "填写失败",
-      save_failed: "保存失败", decision_required: "需要确认", save_ambiguous: "结果不确定", manual_pending: "人工待处理",
-      interrupted_manual: "中断待核对", order_number_blocked: "运单号异常", create_entry_blocked: "创建入口待处理",
-      abandon_pending_close: "放弃待关闭", legacy_checkpoint_blocked: "旧检查点待处理", abandoned: "已放弃",
+      pending: "排队中", creating: "准备页面", waiting_create_entry: "等待开单入口", direct_filling: "填写中", custom_pending: "切换中", custom_filling: "选择到站",
+      verifying: "核对中", ready_to_save: "待保存", saving: "保存中", saved: "已完成", mapping_failed: "没填完",
+      save_failed: "没保存成功", decision_required: "等你确认", save_ambiguous: "结果不确定", manual_pending: "等你处理",
+      interrupted_manual: "待核对", order_number_blocked: "单号有问题", create_entry_blocked: "开单入口有问题",
+      abandon_pending_close: "待关闭页签", legacy_checkpoint_blocked: "旧记录待处理", abandoned: "已放弃",
     })[value] || value;
   }
 
+  // 明细表里的「说明」列：先说人话，原始技术文本折叠在下面（调试模式才显示折叠块）。
   function taskExplanation(task) {
-    if (task.errorCode === "ledger_error") return sanitizeForReport(task, task.error);
-    if (task.state === "saved") return task.cleanup === "retained" ? "已保存；成功页签保留" : "已保存";
-    return sanitizeForReport(task, task.error || task.save.message || "");
+    if (task.state === "saved") return escapeHtml(task.errorCode === "ledger_error" ? "已在网站保存成功，本机记录没写上" : "已在网站保存成功");
+    if (task.state === "abandoned") return escapeHtml("已放弃，不会再处理");
+    if (task.state === "pending") return escapeHtml("排队等待处理");
+    const [title, hint] = MANUAL_STATES.has(task.state) ? taskTrouble(task) : [STAGE_TEXT[task.state] || stateLabel(task.state), ""];
+    const raw = sanitizeForReport(task, task.error || task.save.message || "");
+    const tech = panel.debug && raw ? `<details class="tech"><summary>技术详情</summary><div class="mono">${escapeHtml(`${task.state} / ${task.errorCode || "-"}\n${raw}`)}</div></details>` : "";
+    return `<div>${escapeHtml(title)}</div>${hint ? `<div class="sub">${escapeHtml(hint)}</div>` : ""}${tech}`;
   }
 
   function sanitizeForReport(task, message) {
@@ -1959,7 +2534,10 @@
   }
 
   function setStatus(message, type = "") {
-    if (!state.ui) return; state.ui.status.className = `status${type ? ` ${type}` : ""}`; state.ui.status.textContent = message;
+    if (!state.ui) return;
+    state.ui.status.className = `status${type ? ` ${type}` : ""}`;
+    state.ui.status.textContent = plainStatus(message);
+    if (panel.el?.statusRaw) panel.el.statusRaw.textContent = String(message ?? "");
   }
 
   function waitFor(predicate, timeoutMs, message) {

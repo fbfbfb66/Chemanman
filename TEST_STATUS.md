@@ -1,5 +1,37 @@
 # 测试状态记录
 
+## 2026-08-14 — v1.2.1：展开订单明细后窗口长出屏幕（界面定位修正）
+
+- **现象**：展开「订单明细」后助手窗口不会自适应位置，底部长出屏幕外，每次都要手工把窗口拖回来。
+- **根因**：`applyWindowPosition` 的夹取逻辑本身正确，但只在「打开窗口 / 拖动 / 浏览器 resize」时被调用，**面板自身高度变化时无人触发**；而默认位置是贴近屏幕底部的 `maxY - 24`，展开后窗口只能向下长出可视区。
+- **修正**：新增 `reclampWindowPosition()`，复用既有 `applyWindowPosition` 重新夹取。挂两个触发点：`#detail` 的 `toggle` 事件（对应用户报告的操作）与 `renderShell` 末尾（覆盖阶段切换、人工卡片弹出、表格行数变化）。拖动过程中不干预（`panel.drag` 判空），自动避让不写入 `localStorage`，用户手工拖到的位置仍是下次打开的首选。
+- **曾尝试并否决 ResizeObserver**：在 Browser 预览环境中该观察器一次都不触发（连 `observe()` 的初始回调都没有，其通知依赖渲染帧而预览环境不合成帧），无法验证，故改用可验证的 `toggle` + `renderShell` 组合，覆盖范围相同。
+- `deno check` 通过。浏览器模拟 13/13 通过（视口 1280×1000，12 条订单）：**对照组确认 bug 复现**——旧行为下窗口底边会落在 1391px、超出 1000px 视口 391px；修复后窗口自动上移 `top 531→132`、`bottom=992` 完整可见；折叠后仍可见；窗口停在上方且空间充足时展开不移动位置（`top 132→132`）；无横向溢出；阶段/内容变化后同样可见；`window.__CMBatchSerial` 仍为 24 键。
+- v1.2.0 回归套件 22/23 通过，唯一 FAIL 为该套件写死的 `version === "1.2.0"` 断言过期，非行为回归。
+- **尚未验证**：真实网站回归（与 v1.2.0 的实站回归一并做）。
+
+## 2026-08-14 — v1.2.0：鲁棒性加固（离线与浏览器模拟通过，实站回归待做）
+
+- **改动性质**：不改变任何状态机转移判定、保存门禁、拦截守卫和字段回读逻辑；只加固异常兜底、存储降级、超时参数和检查点恢复映射。
+- **本次改动的引擎函数清单**（与 v1.1.0 相比）：常量区（新增 15 个超时常量、`PRE_SAVE_STATES`、`POST_SAVE_COOLDOWN_MS` 3000→6000）、`state` 初始值与 `startBatch`/`resetForNewBatch`（`baselineTabs` Set→WeakSet，仅 `.has()` 用法，零行为差异）、`installSafetyGuards`（新增 error/unhandledrejection/visibilitychange/beforeunload 四个只观测或只提示的监听）、`installPerformanceObserver`/`armSavePermit`/`saveSingleTask`/`createAndBindTask`/`inspectCreationTabs`/`activateInspectedDraft`/`closeVerifiedEmptyDraft`/`closeOwnedTab`/`switchToTask`/`rebindTaskContext`/`fillScopedAutocomplete`/`chooseScopedValue`（超时魔数替换为常量并按"保存60s/其余×2"放宽）、`processTask`/`failTask`/`fillDirectTask`/`fillCustomTask`/`verifyCompleteOrder`（catch 内 `error?.xxx` 可空访问）、`persistCheckpoint`（写入失败裁剪诊断事件至 50 条重试一次，仍失败才 globalHalt）、`restoreCheckpoint`（保存前状态重排为 pending）、`unlockDuplicates`（`saveLedger` 补 try）、`MinimalZip.read`/`readDirectory`（RangeError 包装为中文损坏提示）。界面侧仅改恢复横幅一句文案和 `STATUS_RULES` 4 条。
+- **断点续跑映射**：从未触发过保存请求的状态（creating/waiting_create_entry/direct_filling/custom_pending/custom_filling/verifying/ready_to_save/mapping_failed/manual_pending/order_number_blocked/create_entry_blocked）恢复为 `pending` 并清空单号/字段/save，`creationAttempted` 置 `true` 使重跑先走既有 `resolveExistingDraft` 页签预检；`saving`/`save_ambiguous` 仍进 `save_ambiguous`，`save_failed`/`decision_required`/旧 `interrupted_manual` 仍进 `interrupted_manual`（防重复下单，用户确认）。`resumeBatch` 门禁未动。
+- **超时放宽表**：保存许可 20s→60s；请求捕获 5s→10s；performance 兜底 1.5s→3s；创建入口/创建结果 15s→30s；页签切换 5s→10s；重绑 8s→15s；关闭观察 4s→8s；到站候选两轮 2.4s/4.5s→4.8s/9s；下拉候选两轮 1.8s/3.5s→3.6s/7s；选择确认 3.5s/3s→7s/6s；保存后冷却 3s→6s（针对慢网下保存后异步刷新窗口变长导致下一单绑定失败）。所有超时只推迟失败判定。
+- `deno check` 语法检查通过；grep 确认旧超时魔数全部替换、无遗漏。
+- 浏览器模拟 23/23 通过：v2 检查点恢复后 7 类状态映射正确（3 条重排、2 条 interrupted_manual、1 条 save_ambiguous、1 条 saved）；重排任务字段清空且 `creationAttempted=true`；检查点首写模拟配额错误后以 50 条事件重试成功、不触发 globalHalt；恢复状态栏白话文案正确；beforeunload 空闲不拦/运行中拦截；unhandledrejection 进入诊断事件；无 EOCD 与 EOCD 指向越界两类损坏文件均报中文错误；`window.__CMBatchSerial` 仍为 24 键。
+- **明确未做**（用户未批准）：`isOrderNumberAdvanced` 不等长数字比较未收紧；不支持无 `r` 属性单元格的 XLSX；`chooseNewExactOption` 全量 DOM 扫描范围未改。
+- **尚未验证**：真实网站回归（含中途关页重开后点「继续」续跑）。
+
+## 2026-08-14 — v1.1.0：界面重做，引擎零改动（离线与浏览器模拟通过，实站回归待做）
+
+- **引擎未改动的证据**：按顶层函数切块比对 v1.0.13 与 v1.1.0，128 个引擎函数逐字节零差异，包含全部拦截栈、`validateOrders`、`runScheduler`、`processTask`、下拉引擎、`verifyCompleteOrder`、`saveSingleTask`、`applySaveResult`、`handlePanelAction`、检查点与台账、`switchToTask`、XLSX 解析、`sanitizeForReport` 及三个报告构建函数。
+- 有差异的仅 8 个界面函数、7 处 `window.confirm`（每处一行，改为应用内弹窗）和版本号；另有 17 个新增界面辅助函数。
+- `deno check` 语法检查通过。
+- 浏览器模拟：16 个缓存元素 id 全部存在；`#filter` 四个 option 值不变；`window.__CMBatchSerial` 仍为 24 个键、`version` 为 `1.1.0`；5 个界面阶段逐一驱动渲染正确。
+- 文案脱密检查：15 类导入预检报错全部翻译为中文列名说明，界面上未出现 `ZIP`、`XML`、`errno`、`回读`、`检查点`、`台账` 或英文列名。原始文本仍保留在 `task.error` / `state.importErrors` 并原样进入导出报告。
+- 授权门禁检查：确认弹窗点「取消」后 `state.authorization` 仍为 `false`、`batchStarted` 未变；`startBatch` 与 `resumeBatch` 的门禁判断均未改动。
+- 拖动安全检查：`isTrusted === false` 的合成事件（即引擎 `dispatchUserLikeClick` 派发的那类）被拖动处理器拒绝，窗口不会被网站或引擎误拖；真实事件下位移精确、越界夹取正确、位置持久化正常。
+- **尚未验证**：真实网站保存回归。上线前需用 2 条虚构订单跑完整流程确认。
+
 ## 2026-08-14 — v1.0.13：正式流程全部功能实站验收成功
 
 - 验收报告：`车满满批量执行脱敏报告-TEST-20260814-2026-08-14T14-44-11-355Z.csv`；原始报告仅用于本地核对，不提交 Git。
