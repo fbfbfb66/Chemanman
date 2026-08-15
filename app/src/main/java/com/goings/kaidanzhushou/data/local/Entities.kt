@@ -4,6 +4,7 @@ import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.PrimaryKey
+import com.goings.kaidanzhushou.domain.AssociationFields
 import com.goings.kaidanzhushou.domain.EditableFields
 import com.goings.kaidanzhushou.domain.RecognitionStatus
 import com.goings.kaidanzhushou.domain.ReviewStatus
@@ -62,16 +63,68 @@ data class RecordEntity(
     val errorMessage: String? = null,
     val attemptCount: Int = 0,
     val rotationDegrees: Int = 0,
+    // 到站归一产物：uniqueKey 是字典主键；display 是上级全称（导出用，落库避免导出时依赖字典）；
+    // candidates 是候选 unique_key 逗号串（复核界面 chip）。
+    val destinationUniqueKey: String? = null,
+    val destinationDisplay: String = "",
+    val destinationCandidates: String = "",
+    // 关联 ID 只描述用户选择的常用信息；运单字段仍保存独立快照，导出不依赖关联表。
+    val receiverProfileId: String? = null,
+    val goodsProfileId: String? = null,
     val updatedAt: Long = capturedAt,
 ) {
     fun editable() = EditableFields(
-        destinationText, deliveryType, senderName, receiverName, receiverMobile,
-        goodsName, packageName, quantity, weight, volume, freight, paymentType,
+        destinationText = destinationText, deliveryType = deliveryType, senderName = senderName,
+        receiverName = receiverName, receiverMobile = receiverMobile, goodsName = goodsName,
+        packageName = packageName, quantity = quantity, weight = weight, volume = volume,
+        freight = freight, paymentType = paymentType, destinationUniqueKey = destinationUniqueKey,
+        receiverProfileId = receiverProfileId,
+        goodsProfileId = goodsProfileId,
+        receiverAssociationResolved = AssociationFields.RECEIVER !in uncertainFieldSet(),
+        goodsAssociationResolved = AssociationFields.GOODS !in uncertainFieldSet(),
     )
+
+    fun destinationCandidateList(): List<String> = destinationCandidates.split(',').filter(String::isNotBlank)
 
     fun uncertainFieldSet(): Set<String> = uncertainFields.split(',').filter(String::isNotBlank).toSet()
     fun editedFieldSet(): Set<String> = editedFields.split(',').filter(String::isNotBlank).toSet()
 }
+
+@Entity(
+    tableName = "receiver_profiles",
+    indices = [Index("normalizedName"), Index("lastUsedAt")],
+)
+data class ReceiverProfileEntity(
+    @PrimaryKey val id: String,
+    val name: String,
+    val normalizedName: String,
+    val phone: String,
+    val useCount: Int,
+    val lastUsedAt: Long,
+    val createdAt: Long,
+    val updatedAt: Long,
+)
+
+@Entity(
+    tableName = "goods_profiles",
+    indices = [Index("normalizedName"), Index("lastUsedAt")],
+)
+data class GoodsProfileEntity(
+    @PrimaryKey val id: String,
+    val name: String,
+    val normalizedName: String,
+    val packageName: String,
+    val useCount: Int,
+    val lastUsedAt: Long,
+    val createdAt: Long,
+    val updatedAt: Long,
+)
+
+@Entity(tableName = "profile_learning_state")
+data class ProfileLearningStateEntity(
+    @PrimaryKey val key: String,
+    val completedAt: Long,
+)
 
 @Entity(
     tableName = "exports",

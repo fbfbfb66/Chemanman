@@ -1,5 +1,36 @@
 # 测试状态记录
 
+## 2026-08-15 — 脚本 v1.4.0 + App 1.2.0：到站标准化闭环（离线测试通过，实站回归待做）
+
+- **动机**：勾选表式托运单（「玉溪 | 通海」勾在玉溪）被 AI 拼成「玉溪通海」，车满满自动补全匹配不到 → `mapping_failed`。根因是 AI 没有站点字典却被要求决定标准站名。
+- **方案四层**：① 油猴从 `Nsug/sug` 拉常用到站生成字典（`unique_key` 为主键，`id` 在 type:4 关键词条目上恒为 0 不可用；别名精确名优先，「玉溪」指向关键词站而非玉溪市；昆明标 excluded）并导出给手机；② Kimi 契约改为 5 个取证键（raw_tokens 逐字照抄严禁拼接 + checked_token + mark_type + layout + canonical），canonical 用 json_schema enum 硬约束为字典站名，解码层面即不可能输出「玉溪通海」；③ App 端 `DestinationNormalizer` 确定性归一：有勾用勾、checklist 无勾一律留空强制人工点选、手写上下级链取最细粒度标待复核、「玉溪通海」单 token 由最长匹配分词救回；④ 闭环：XLSX v1.2 新增 `destination_unique_key`/`destination_display` 可选列（v1.1 旧表照常导入）、复核界面候选 chip、油猴预检归一 + 歧义弹窗点选 + 别名学习表（`cm-batch-destination-alias-v1`，随字典导出回流手机）。
+- **不变量核查**：`chooseNewExactOption` 歧义即停零改动；运行循环仍无人值守（点选只在预检与已暂停的 mapping_failed 态）；`"destination_text"` 全链路身份标识未改名；`keep()` 到站三件套共用同一保护 key；诊断新事件只记 `value_hash`。
+- App：Room v3→v4 迁移（三列，手写 Migration + androidTest 用例）；`testDebugUnitTest` 全绿（Domain/Destination/KimiClient/Xlsx 四套，含 12 个归一用例）；`assembleDebug` 与 androidTest 编译通过。gradle 需 `JAVA_HOME=C:\Program Files\Android\Android Studio\jbr`。
+- 脚本：`deno check` 通过；`deno run -A script/tests/destination-dictionary.test.mjs`（字典生成/别名冲突/parent 链/v1.2 双向兼容/别名学习，deno 2.9 的 node 兼容层可直接跑）与 `payment-schema.test.mjs` 均通过。
+- **尚未验证（实站）**：sug 观察与主动拉取的真实回包、导出字典内容、真实勾选表照片的 raw_tokens 质量、v1.2 表格实站串行保存、`data-*` 编码交叉校验在真实控件上的表现（属性名未实证，实现为存在且形似编码才比较）。
+
+### 同日补充之二：按方案 A 拆掉字典同步机制（站点表改为内置）
+
+- **动机**：确认只有两条到站后，「从网站 sug 拉字典 → 导出 → 传手机 → 导入」整套同步机制成了空转——两条都是几年不变的国标行政区划，别名规则自动生成后也没有可学的东西。用户直接提出质疑（「为什么必须手动导入」），说明这层抽象的理解成本已经超过收益。
+- **删除**（油猴）：`#btnDict` 导出按钮、`exportDestinationDictionary`、`fetchCommonDestinations`、`buildDestinationDictionary`、`generateStationAliases`、`loadStoredDictionary`/`saveStoredDictionary`、别名学习表（`loadDestinationAliases`/`saveDestinationAliases`/`learnDestinationAlias` 与 `cm-batch-destination-alias-v1` 键）、`pageObserverBootstrap` 里的 sug 观察分支与 `handlePageObserverEvent` 的 `sug_observed` 拦截、`state.sugContext`/`state.sugCommonPois`。站点表改为文件顶部的 `DESTINATIONS` 常量 + `DESTINATION_INDEX` 查表。
+- **删除**（App）：`DictionaryStore.import()` 与 filesDir 优先逻辑（改为纯 assets 加载）、`MainViewModel.importDictionary()`、设置页的导入按钮（改为只读展示在发到站）、`DestinationDictionary` 的 `manual_aliases`/`learned_aliases` 字段与 `LearnedAlias` 类型、`lookup()` 的三级查找（简化为只查 `alias_index`）、`candidatesFor` 的历史频次权重。
+- **删除**（安全性动机）：`verifyDestinationKeyAttribute` 里比对**纯数字**属性的那半条。网站在 `data-id`/`data-value` 里放的很可能是行号之类的内部 id，拿它比对会造成假阳性停批，而在两条站点下收益几乎为零。保留 `xzqh_*` 前缀那半条——那个格式是车满满自己的站点编码，不一致必是选错了，不会误伤。
+- **保留**：AI 只取证不下结论（raw_tokens/checked_token/layout）、enum 硬约束、本地 `DestinationNormalizer` 三条裁决规则、复核界面候选 chip、XLSX v1.2 两个可选列与 v1.1 向后兼容、`uiChoose` 与 mapping_failed 的「重新选择到站」。核心修复一点没动。
+- `prepareDestinations` 改为同步函数（不再有弹窗），逻辑简化为：编码优先 → 名字/别名 → 查不到原样保留交给网站自动补全，不猜。终态订单跳过。
+- 测试文件 `destination-dictionary.test.mjs` 重命名为 `destination.test.mjs`，内容改为覆盖内置表一致性（含与 assets 的 unique_key 对齐断言）、查表、`prepareDestinations` 五种输入、XLSX v1.2 双向兼容。App 侧删除 `learnedAliasWinsOverIndex` 用例。
+- 验证：`deno check` 通过；`destination.test.mjs` 与 `payment-schema.test.mjs` 全绿；`testDebugUnitTest` + `assembleDebug` + androidTest 编译全部通过；grep 确认无残留引用。
+- **遗留**：`AppContainer.appContext` 原本只为 `importDictionary` 而加，现已无引用，因该文件正被并行修改故未删除。
+
+### 同日补充：到站白名单收敛为两条 + 修复 excluded 站误占别名槽位
+
+- **用户确认**：实际在发的到站只有两条——`通海县`（`xzqh_id_38010`）与 `玉溪市`（`xzqh_id_37979`）。其中「通海」有实证：`Har/05-save-success.har` 的 coHandle 保存体里 `arr_info={"id":"38010","show_val":"通海县","city":"玉溪市","adcode":"530423","type":"3"}`。「玉溪」无历史保存记录，由用户口头确认为**行政区划玉溪市**，而非同名的自定义关键词站 `xzqh_kw_玉溪`。
+- **发现并修复的 bug**：`buildDestinationDictionary` 原先用**全部**站点（含 excluded）建 `exactOwner` 占坑表。把 `xzqh_kw_玉溪` 标为 excluded 后，它仍占着「玉溪」的精确名槽位，导致玉溪市的生成别名「玉溪」被判为冲突丢弃、`alias_index["玉溪"]` 变空——最常见的单子会每次都落到人工。修复为**占坑与索引都只算可选站**：选不中的站不得阻挡别人的别名。已加回归断言 `alias_index["玉溪"] === ["xzqh_id_37979"]` 与 `conflicts === []`；同时保留「两个可选站真撞名时仍按精确名优先」的用例（`allowedNames: ["玉溪市","玉溪"]` 变体）。
+- **白名单机制**：新增常量 `ACTIVE_DESTINATION_NAMES = ["通海县","玉溪市"]`，`buildDestinationDictionary` 改为白名单优先（`allowedNames` 非空时，不在名单内的一律 `excluded`，reason 为 `not_in_use`；发货地昆明仍为 `origin`）。所有站点仍完整保留在 `stations` 数组里，只是不可选，便于日后放开。
+- 内置 `app/src/main/assets/destination_dictionary.json` 已同步为该真值（2 条可选 + 4 条 excluded，`conflicts` 为空）。`DestinationTest` 与 `KimiClientTest` 的夹具一并改为生产真值——原先断言「玉溪→关键词站」的用例业务结论已反转，改为断言归到玉溪市。
+- 因两条可选站互为上下级、构造不出「无关多地名」，`unrelatedPlacesAreRejected` 改用放开郑州的变体字典守住该分支；另新增「未知地名 + 已知地名 → 归到已知的那个但必标待复核」用例。
+- 验证：`testDebugUnitTest` 全绿；两套 `.mjs` 脚本测试全绿。
+- **App 字典导入状态**：截至本次，手机端从未执行过导入，跑的是内置兜底那份。正式启用前仍须用正式账号导出一次真实字典并在设置页导入（生产环境的 `xzqh_id_*` 是否与测试环境一致尚未验证）。
+
 ## 2026-08-14 — v1.2.1：实站回归通过（真实系统验证）
 
 - 用户在真实车满满系统完成 v1.2.1 实站测试，确认**一切正常**，本轮任务收尾。

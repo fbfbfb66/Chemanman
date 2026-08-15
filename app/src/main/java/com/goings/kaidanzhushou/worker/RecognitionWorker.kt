@@ -13,6 +13,7 @@ import com.goings.kaidanzhushou.KaidanApplication
 import com.goings.kaidanzhushou.data.local.RecordEntity
 import com.goings.kaidanzhushou.data.remote.KimiErrorKind
 import com.goings.kaidanzhushou.data.remote.KimiException
+import com.goings.kaidanzhushou.domain.DestinationNormalizer
 import com.goings.kaidanzhushou.domain.RecognitionStatus
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -57,7 +58,9 @@ class RecognitionWorker(context: Context, params: WorkerParameters) : CoroutineW
             dao.updateRecord(record)
             try {
                 val draft = container.kimiClient.recognize(apiKey, upload)
-                container.repository.applyDraft(record.id, draft)
+                // 字典依赖留在 Worker：Repository 只接确定性的归一结果。
+                val resolution = DestinationNormalizer.resolve(draft.destinationEvidence(), container.dictionaryStore.current())
+                container.repository.applyDraft(record.id, draft, resolution)
                 controller.success()
                 return
             } catch (error: KimiException) {

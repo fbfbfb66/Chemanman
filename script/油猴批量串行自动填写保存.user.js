@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         车满满批量串行自动填写保存
 // @namespace    codex.chemanman.batch-serial.production
-// @version      1.3.0
-// @description  从本地 XLSX 严格逐条填写保存。兼容 Schema v1.1 的现付、到付和回付，串行保存逻辑保持不变。
+// @version      1.4.0
+// @description  从本地 XLSX 严格逐条填写保存。兼容 Schema v1.1 的现付、到付和回付，串行保存逻辑保持不变。支持导出常用到站字典供手机 App 使用。
 // @author       User
 // @match        https://t800.chemanman.com/Order*
 // @run-at       document-start
@@ -12,7 +12,7 @@
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "1.3.0";
+  const SCRIPT_VERSION = "1.4.0";
   const CHECKPOINT_VERSION = 3;
   const MAX_ORDERS = 100;
   const SERIAL_CONCURRENCY = 1;
@@ -22,6 +22,24 @@
   const LEGACY_CHECKPOINT_KEY = "cm-batch-parallel-checkpoint-v1";
   const LEDGER_KEY = "cm-batch-order-ledger-v1";
   const LEGACY_LEDGER_KEY = "cm-batch-parallel-ledger-v1";
+  // 实际在发的到站（用户 2026-08-15 确认，只有这两条）。两条都是国标行政区划，基本不会变，
+  // 所以直接内置，不做「从网站同步字典」那套。要加站点就在这里加一条，并同步改
+  // app/src/main/assets/destination_dictionary.json（两边必须一致，unique_key 是连接键）。
+  // 注意「玉溪」指行政区划玉溪市（通海县的上级市），不是系统里同名的自定义关键词站 xzqh_kw_玉溪。
+  const DESTINATIONS = [
+    { unique_key: "xzqh_id_38010", name: "通海县", showpname: "云南省玉溪市", aliases: ["通海"] },
+    { unique_key: "xzqh_id_37979", name: "玉溪市", showpname: "云南省", aliases: ["玉溪"] },
+  ];
+  const DESTINATION_INDEX = (() => {
+    const index = new Map();
+    for (const station of DESTINATIONS) {
+      for (const token of [station.name, ...station.aliases]) {
+        const key = normalizeDestinationToken(token);
+        if (key) index.set(key, station);
+      }
+    }
+    return index;
+  })();
   const BLOCKED_REQUEST = /\/api\/Order\/Order\/coHandle(?:\/|\?|$)/i;
   const SAVE_BUTTON_TEXT = /^(保存(?:\(F9\))?|保存并打印|保存并关闭|提交运单|继续保存)$/i;
   const DIAGNOSTIC_SCHEMA_VERSION = 1;
@@ -49,6 +67,9 @@
     "delivery_type", "sender_name", "receiver_name", "receiver_mobile", "goods_name",
     "package", "quantity", "weight", "volume", "freight", "payment_type",
   ];
+  // v1.2 新增列：只在存在时读取，不参与表头必备校验——v1.1 旧表必须照常导入。
+  const OPTIONAL_HEADERS = ["destination_unique_key", "destination_display"];
+  const DESTINATION_KEY_PATTERN = /^xzqh_(id_\d+|kw_.+)$/;
   const FIELD_MAPPINGS = [
     { key: "destination_text", dataPath: "arr", kind: "autocomplete", required: true },
     { key: "delivery_type", dataPath: "delivery_mode", kind: "choice", required: true, display: { delivery: "送货", pickup: "自提" } },
@@ -264,7 +285,7 @@
     const task = state.tasks.find((item) => item.id === taskId);
     let output = String(value || "");
     if (task) {
-      for (const key of ["source_label", "destination_text", "sender_name", "receiver_name", "receiver_mobile", "goods_name", "package"]) {
+      for (const key of ["source_label", "destination_text", "destination_display", "sender_name", "receiver_name", "receiver_mobile", "goods_name", "package"]) {
         const text = String(task.order?.[key] ?? "").trim();
         if (text.length >= 2) output = output.split(text).join("<已脱敏>");
       }
@@ -514,7 +535,7 @@
       "runTitle", "runCount", "runFill", "runDetail", "btnResume",
       "manualTitle", "manualHint", "manualWho", "manualActions", "manualTech", "manualRaw", "manualRest",
       "doneTitle", "doneText", "detail", "detailHint", "btnExport2", "rawbox",
-      "modal", "modalTitle", "modalText", "modalOk", "modalCancel",
+      "modal", "modalTitle", "modalText", "modalList", "modalOk", "modalCancel",
     ].map((id) => [id, shadow.getElementById(id)]));
     state.ui.file.addEventListener("change", handleFileSelection);
     state.ui.authorize.addEventListener("change", () => { state.authorization = state.ui.authorize.checked; renderSummary(); });
@@ -651,6 +672,33 @@
     });
   }
 
+  // 候选点选弹窗：复用确认弹窗的骨架与 resolver，把「确认」按钮换成候选列表。
+  // Esc/点遮罩/取消 都会以 false 走 panel.confirm，这里统一映射为 null（未选择）。
+  function uiChoose(text, options, meta = {}) {
+    const el = panel.el;
+    if (!el.modal || !options.length) return Promise.resolve(null);
+    panel.confirm?.(false);
+    return new Promise((resolve) => {
+      el.modalTitle.textContent = meta.title || "请选择";
+      el.modalText.textContent = text;
+      el.modalList.innerHTML = options.map((option, index) => `<button type="button" class="opt" data-choice="${index}">${escapeHtml(option.label)}</button>`).join("");
+      el.modalList.hidden = false;
+      el.modalOk.hidden = true;
+      el.modalCancel.textContent = meta.cancelText || "先跳过";
+      el.modal.hidden = false;
+      setWindowOpen(true);
+      el.modalList.onclick = (event) => {
+        const button = event.target.closest("button[data-choice]"); if (!button) return;
+        panel.confirm?.(options[Number(button.dataset.choice)] ?? null);
+      };
+      panel.confirm = (value) => {
+        el.modal.hidden = true; el.modalList.hidden = true; el.modalList.innerHTML = ""; el.modalList.onclick = null;
+        el.modalOk.hidden = false; el.modalCancel.textContent = "取消"; panel.confirm = null;
+        resolve(value && typeof value === "object" ? value : null);
+      };
+    });
+  }
+
   // 「开始」和「继续」都需要真实保存授权。这里只负责把授权勾选框换成一个说人话的弹窗，
   // 门禁本身仍由 startBatch / resumeBatch 中原有的 state.authorization 判断决定。
   async function requestAuthorizedRun(kind) {
@@ -759,6 +807,9 @@
         .sheet{width:440px;max-width:100%;background:#fff;border-radius:14px;padding:22px;box-shadow:0 24px 60px rgba(15,23,42,.35)}
         .sheet .mt{font-size:17px;font-weight:600;margin-bottom:8px}
         .sheet .mx{color:#475569;margin-bottom:20px}
+        .sheet .mlist{display:flex;flex-direction:column;gap:6px;max-height:300px;overflow:auto;margin:-8px 0 16px}
+        .sheet .mlist .opt{border:1px solid #e5e7eb;background:#f8fafc;border-radius:10px;padding:9px 12px;font:14px/1.4 inherit;text-align:left;cursor:pointer}
+        .sheet .mlist .opt:hover{border-color:#2563eb;background:#eff6ff}
         .sheet .mb{display:flex;justify-content:flex-end;gap:10px}
         .sink{position:absolute;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none}
         [hidden]{display:none !important}
@@ -826,7 +877,7 @@
         </div>
         <div class="statusbar"><div id="status" class="status">请选择要处理的 Excel 表格。</div><div class="mono" id="statusRaw" hidden></div></div>
       </section>
-      <div class="modal" id="modal" hidden><div class="sheet"><div class="mt" id="modalTitle"></div><div class="mx" id="modalText"></div><div class="mb"><button class="btn" id="modalCancel" type="button">取消</button><button class="btn primary" id="modalOk" type="button">确认</button></div></div></div>
+      <div class="modal" id="modal" hidden><div class="sheet"><div class="mt" id="modalTitle"></div><div class="mx" id="modalText"></div><div class="mlist" id="modalList" hidden></div><div class="mb"><button class="btn" id="modalCancel" type="button">取消</button><button class="btn primary" id="modalOk" type="button">确认</button></div></div></div>
       <div class="sink"><input id="file" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"><input id="authorize" type="checkbox"><button id="start" type="button"></button><button id="resume" type="button"></button></div>`;
   }
 
@@ -861,9 +912,9 @@
     for (const row of parsed.rows || []) {
       const label = `第 ${row.__rowNumber || "?"} 行`; const order = { ...row }; delete order.__rowNumber; delete order.__formulaFields;
       if (row.__formulaFields?.length) errors.push(`${label}：不允许公式单元格（${row.__formulaFields.join("、")}）`);
-      for (const key of REQUIRED_HEADERS) if (typeof order[key] === "string" && /^(null|undefined)$/i.test(order[key].trim())) errors.push(`${label} ${key}：不得用 ${order[key]} 表示空值`);
+      for (const key of [...REQUIRED_HEADERS, ...OPTIONAL_HEADERS]) if (typeof order[key] === "string" && /^(null|undefined)$/i.test(order[key].trim())) errors.push(`${label} ${key}：不得用 ${order[key]} 表示空值`);
       const schemaVersion = String(order.schema_version || "").trim();
-      if (!["v1.0", "v1.1"].includes(schemaVersion)) errors.push(`${label} schema_version：必须为 v1.0 或 v1.1`);
+      if (!["v1.0", "v1.1", "v1.2"].includes(schemaVersion)) errors.push(`${label} schema_version：必须为 v1.0、v1.1 或 v1.2`);
       const id = String(order.source_record_id || "").trim(); const batchId = String(order.batch_id || "").trim();
       if (!id) errors.push(`${label} source_record_id：不能为空`);
       if (seen.has(id)) errors.push(`${label} source_record_id：${id} 重复`); seen.add(id);
@@ -880,6 +931,12 @@
       const freight = toNumber(order.freight); if (!Number.isFinite(freight) || freight < 0 || !hasAtMostTwoDecimals(freight)) errors.push(`${label} freight：必须为非负数且最多两位小数`); order.freight = freight;
       order.receiver_mobile = isBlank(order.receiver_mobile) ? "" : String(order.receiver_mobile).trim();
       order.package = isBlank(order.package) ? "" : String(order.package).trim();
+      order.destination_unique_key = isBlank(order.destination_unique_key) ? "" : String(order.destination_unique_key).trim();
+      order.destination_display = isBlank(order.destination_display) ? "" : String(order.destination_display).trim();
+      // 允许为空（App 可能没解析出来，回退纯文本填写）；非空则必须是合法的字典主键。
+      if (order.destination_unique_key && !DESTINATION_KEY_PATTERN.test(order.destination_unique_key)) {
+        errors.push(`${label} destination_unique_key：格式必须形如 xzqh_id_38010 或 xzqh_kw_开航`);
+      }
       for (const key of ["schema_version", "batch_id", "source_record_id", "source_label", "destination_text", "delivery_type", "sender_name", "receiver_name", "goods_name", "payment_type"]) order[key] = String(order[key] ?? "").trim();
       const key = ledgerKey(batchId, id); if (!options.ignoreLedger && ledger.records[key]) duplicateKeys.push(key);
       orders.push(order);
@@ -904,8 +961,33 @@
     if (state.running || state.batchStarted || state.importErrors.length || !state.tasks.length) return;
     if (!state.authorization) { setStatus("请先确认已核对订单并授权真实保存。", "error"); return; }
     if (detectConflictingScript()) { setStatus("检测到其他测试脚本，请只启用正式版并刷新。", "error"); return; }
+    // 开跑前先把到站归一到标准名，运行循环保持完全无人值守。
+    prepareDestinations();
     state.batchStarted = true; state.baselineTabs = new WeakSet(listTabElements()); state.pauseRequested = false; state.stopRequested = false;
     persistCheckpoint(); await runScheduler();
+  }
+
+  // 开跑前把每一单的到站换成站点表里的标准名，保证打进网站的字符串一定存在且唯一。
+  // 编码优先（App 已经归一过），其次按名字/别名查；查不到就原样保留，交给网站自动补全，
+  // 真不行会停在 mapping_failed 让人点选——这里不猜。
+  function prepareDestinations() {
+    let unknown = 0;
+    for (const task of state.tasks) {
+      if (TERMINAL_STATES.has(task.state)) continue;
+      const order = task.order;
+      const station = (order.destination_unique_key && findDestinationByKey(order.destination_unique_key))
+        || findDestination(order.destination_text);
+      if (station) {
+        order.destination_text = station.name;
+        order.destination_unique_key = station.unique_key;
+        continue;
+      }
+      unknown++;
+      recordDiagnostic("destination_not_in_table", { value_hash: stableHash(order.destination_text || "") }, task.id);
+    }
+    if (unknown) {
+      setStatus(`有 ${unknown} 条订单的到站不在内置站点表（${DESTINATIONS.map((item) => item.name).join("、")}）里，将按表格原文填写。`, "warning");
+    }
   }
 
   async function runScheduler() {
@@ -1283,6 +1365,21 @@
     }
     if (!selected) throw new Error(`未找到唯一候选：${value}`);
     await waitFor(() => control.getAttribute("data-is-select") === "1" && normalizeText(readControl(control) || control.title) === normalizeText(value), DATALIST_CONFIRM_TIMEOUT_MS, `候选点击后网站未确认：${value}`);
+    verifyDestinationKeyAttribute(control, task);
+  }
+
+  // 事后交叉校验：只认形如 xzqh_* 的属性值——那是车满满自己的站点编码格式，不一致必是选错了。
+  // 刻意不比对纯数字属性：网站在 data-id/data-value 里放的很可能是行号之类的内部 id，
+  // 拿它比对会造成假阳性停批，而收益几乎为零。属性不存在时走既有的文本回读校验。
+  function verifyDestinationKeyAttribute(control, task) {
+    const expectedKey = String(task?.order?.destination_unique_key || "").trim();
+    if (!expectedKey) return;
+    for (const name of ["data-unique-key", "data-key", "data-id", "data-value"]) {
+      const attr = String(control.getAttribute(name) || "").trim();
+      if (!attr || !/^xzqh_/.test(attr) || attr === expectedKey) continue;
+      recordDiagnostic("destination_key_mismatch", { attribute: name, value_hash: stableHash(attr) }, task?.id || "");
+      throw new Error("到站编码与网站选中项不一致，已停止避免填错站");
+    }
   }
 
   async function resetAndEnterAutocompleteQuery(control, value, task, options = {}) {
@@ -1577,6 +1674,7 @@
       if (action === "activate") await withOperationLock(() => switchToTask(task));
       else if (action === "continue-save") await continueDecision(task);
       else if (action === "repair") await repairAndSave(task);
+      else if (action === "choose-destination") await chooseDestinationForTask(task);
       else if (action === "abandon") await abandonTask(task);
       else if (action === "confirm-saved") await confirmAmbiguousSaved(task);
       else if (action === "confirm-not-saved") await confirmNotSaved(task);
@@ -1608,6 +1706,28 @@
       transitionTask(task, "ready_to_save");
     });
     await saveSingleTask(task, { manual: true, reason: "repair_after_manual" });
+  }
+
+  // mapping_failed 人工态的到站重选：批次已暂停、用户在场，选完自动把到站重填一遍。
+  // 保存仍走既有的「我已改好，继续保存」按钮，不绕过任何回读校验。
+  async function chooseDestinationForTask(task) {
+    if (task.state !== "mapping_failed" || !task.tab?.isConnected || !task.root?.isConnected) throw new Error("该订单当前无法重选到站");
+    const choice = await uiChoose(
+      `为订单 ${task.order.source_record_id} 重新选择到站（表格里写的是「${task.order.destination_text}」）：`,
+      DESTINATIONS.map((station) => ({ label: destinationLabel(station), station })),
+      { title: "重新选择到站", cancelText: "取消" },
+    );
+    if (!choice) return;
+    task.order.destination_text = choice.station.name;
+    task.order.destination_unique_key = choice.station.unique_key;
+    recordDiagnostic("destination_rechosen", { value_hash: stableHash(choice.station.unique_key) }, task.id);
+    await withOperationLock(async () => {
+      await switchToTask(task);
+      const control = uniqueControlInTask(task, "arr");
+      await fillScopedAutocomplete(control, task.order.destination_text, task);
+    });
+    task.error = ""; task.errorCode = "";
+    setStatus(`已把到站改为「${choice.station.name}」并重新填好。请检查后点「我已改好，继续保存」。`, "warning");
   }
 
   async function abandonTask(task) {
@@ -1826,6 +1946,23 @@
     const ledger = loadLedger(); ledger.records[ledgerKey(task.order.batch_id, task.order.source_record_id)] = {
       batch_id: task.order.batch_id, source_record_id: task.order.source_record_id, completed_at: now(), identity_fingerprint: task.save.identity_fingerprint || "",
     }; saveLedger(ledger);
+  }
+
+  // ——— 到站 ———
+  // 站点表内置在文件顶部的 DESTINATIONS 常量里，不从网站同步。
+
+  function normalizeDestinationToken(value) {
+    return String(value ?? "").replace(/\s+/g, "").replace(/[·．.，,、/／()（）\-—－]/g, "");
+  }
+
+  function findDestination(token) {
+    return DESTINATION_INDEX.get(normalizeDestinationToken(token)) || null;
+  }
+  function findDestinationByKey(uniqueKey) {
+    return DESTINATIONS.find((station) => station.unique_key === uniqueKey) || null;
+  }
+  function destinationLabel(station) {
+    return station.showpname ? `${station.name}（${station.showpname}）` : station.name;
   }
 
   async function unlockDuplicates() {
@@ -2071,7 +2208,7 @@
     const errors = missing.map((header) => `缺少列：${header}`);
     const dataRows = rows.filter((row) => row.rowNumber > headerRow.rowNumber).map((row) => {
       const output = { __rowNumber: row.rowNumber, __formulaFields: [] };
-      for (const header of REQUIRED_HEADERS) {
+      for (const header of [...REQUIRED_HEADERS, ...OPTIONAL_HEADERS]) {
         const cell = row.cells.get(headerColumns.get(header));
         output[header] = cell?.value ?? "";
         if (cell?.formula) output.__formulaFields.push(header);
@@ -2174,6 +2311,7 @@
     destination_text: "到站", delivery_type: "送货方式", sender_name: "发货人", receiver_name: "收货人",
     receiver_mobile: "收货人电话", goods_name: "货物名称", package: "包装", quantity: "件数",
     weight: "重量", volume: "体积", freight: "运费", payment_type: "付款方式",
+    destination_unique_key: "到站编码", destination_display: "到站全称",
   };
 
   const STAGE_TEXT = {
@@ -2425,6 +2563,7 @@
     if (task.state === "decision_required") {
       buttons.push(actionButton(task, "continue-save", "继续保存", false, "primary", size));
     }
+    if (task.state === "mapping_failed" && task.tab?.isConnected) buttons.push(actionButton(task, "choose-destination", "重新选择到站", false, "", size));
     if (["mapping_failed", "save_failed", "manual_pending"].includes(task.state) && task.tab?.isConnected) buttons.push(actionButton(task, "repair", "我已改好，继续保存", false, "primary", size));
     if (task.state === "order_number_blocked" && task.ownedTab) buttons.push(actionButton(task, "retry-order", "关掉重新开一单", false, "", size));
     if (task.state === "order_number_blocked" && !task.ownedTab) buttons.push(actionButton(task, "retry-preflight", "重新检查", false, "", size));
@@ -2469,7 +2608,7 @@
   function sanitizeForReport(task, message) {
     let output = String(message || "");
     for (const [key, value] of Object.entries(task?.order || {})) {
-      if (["batch_id", "source_record_id", "schema_version", "delivery_type", "payment_type"].includes(key)) continue;
+      if (["batch_id", "source_record_id", "schema_version", "delivery_type", "payment_type", "destination_unique_key"].includes(key)) continue;
       const text = String(value ?? "").trim(); if (text.length >= 2) output = output.split(text).join("<已脱敏>");
     }
     return output.replace(/1\d{10}/g, "<手机号已脱敏>");
@@ -2574,5 +2713,6 @@
     parseXlsxArrayBuffer, validateOrders, classifySaveResponse, extractOrderIdentity, sanitizeForReport, ledgerKey,
     readOrderNumber, normalizeOrderNumber, isOrderNumberAdvanced, orderNumberSuffix, locateCreateOrderAction,
     nextPendingTask, unlockDuplicates, pauseBatch, stopBatch, switchToTask, buildDiagnosticReport, state,
+    destinations: DESTINATIONS, normalizeDestinationToken, findDestination, findDestinationByKey, prepareDestinations,
   });
 })();

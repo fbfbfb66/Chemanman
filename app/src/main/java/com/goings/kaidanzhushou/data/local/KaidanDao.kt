@@ -45,6 +45,9 @@ interface KaidanDao {
     @Query("SELECT * FROM records WHERE batchId = :batchId ORDER BY ordinal")
     suspend fun getRecords(batchId: String): List<RecordEntity>
 
+    @Query("SELECT * FROM records WHERE reviewStatus = 'CONFIRMED' ORDER BY updatedAt, id")
+    suspend fun getConfirmedRecords(): List<RecordEntity>
+
     @Query("SELECT * FROM records WHERE id = :id")
     fun observeRecord(id: String): Flow<RecordEntity?>
 
@@ -65,6 +68,9 @@ interface KaidanDao {
 
     @Update suspend fun updateRecord(record: RecordEntity)
 
+    @Query("UPDATE records SET receiverProfileId = :receiverProfileId, goodsProfileId = :goodsProfileId WHERE id = :id")
+    suspend fun updateRecordProfileLinks(id: String, receiverProfileId: String?, goodsProfileId: String?)
+
     @Query("UPDATE records SET rotationDegrees = :rotationDegrees WHERE id = :id")
     suspend fun updateRotation(id: String, rotationDegrees: Int)
 
@@ -84,6 +90,56 @@ interface KaidanDao {
 
     @Query("SELECT * FROM exports WHERE batchId = :batchId ORDER BY exportedAt DESC")
     fun observeExports(batchId: String): Flow<List<ExportEntity>>
+
+    @Query("SELECT * FROM receiver_profiles ORDER BY lastUsedAt DESC, useCount DESC, name")
+    fun observeReceiverProfiles(): Flow<List<ReceiverProfileEntity>>
+
+    @Query("SELECT * FROM receiver_profiles ORDER BY lastUsedAt DESC, useCount DESC, name")
+    suspend fun getReceiverProfiles(): List<ReceiverProfileEntity>
+
+    @Query("SELECT * FROM receiver_profiles WHERE id = :id")
+    suspend fun getReceiverProfile(id: String): ReceiverProfileEntity?
+
+    @Query("SELECT * FROM receiver_profiles WHERE normalizedName = :normalizedName ORDER BY lastUsedAt DESC, useCount DESC")
+    suspend fun getReceiverProfilesByName(normalizedName: String): List<ReceiverProfileEntity>
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertReceiverProfile(profile: ReceiverProfileEntity)
+
+    @Update suspend fun updateReceiverProfile(profile: ReceiverProfileEntity)
+
+    @Delete suspend fun deleteReceiverProfile(profile: ReceiverProfileEntity)
+
+    @Query("UPDATE records SET receiverProfileId = :targetId WHERE receiverProfileId = :sourceId")
+    suspend fun replaceReceiverProfileLinks(sourceId: String, targetId: String)
+
+    @Query("SELECT * FROM goods_profiles ORDER BY lastUsedAt DESC, useCount DESC, name")
+    fun observeGoodsProfiles(): Flow<List<GoodsProfileEntity>>
+
+    @Query("SELECT * FROM goods_profiles ORDER BY lastUsedAt DESC, useCount DESC, name")
+    suspend fun getGoodsProfiles(): List<GoodsProfileEntity>
+
+    @Query("SELECT * FROM goods_profiles WHERE id = :id")
+    suspend fun getGoodsProfile(id: String): GoodsProfileEntity?
+
+    @Query("SELECT * FROM goods_profiles WHERE normalizedName = :normalizedName ORDER BY lastUsedAt DESC, useCount DESC")
+    suspend fun getGoodsProfilesByName(normalizedName: String): List<GoodsProfileEntity>
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertGoodsProfile(profile: GoodsProfileEntity)
+
+    @Update suspend fun updateGoodsProfile(profile: GoodsProfileEntity)
+
+    @Delete suspend fun deleteGoodsProfile(profile: GoodsProfileEntity)
+
+    @Query("UPDATE records SET goodsProfileId = :targetId WHERE goodsProfileId = :sourceId")
+    suspend fun replaceGoodsProfileLinks(sourceId: String, targetId: String)
+
+    @Query("SELECT * FROM profile_learning_state WHERE `key` = :key")
+    suspend fun getProfileLearningState(key: String): ProfileLearningStateEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun putProfileLearningState(state: ProfileLearningStateEntity)
 
     @Transaction
     suspend fun bumpRevision(batchId: String) {
