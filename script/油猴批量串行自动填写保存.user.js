@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         车满满批量串行自动填写保存
 // @namespace    codex.chemanman.batch-serial.production
-// @version      1.4.3
+// @version      1.4.4
 // @description  从本地 XLSX 严格逐条填写保存。兼容 Schema v1.1 的现付、到付和回付，串行保存逻辑保持不变。支持导出常用到站字典供手机 App 使用。
 // @author       User
 // @match        https://t800.chemanman.com/Order*
@@ -12,7 +12,7 @@
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "1.4.3";
+  const SCRIPT_VERSION = "1.4.4";
   const CHECKPOINT_VERSION = 3;
   const MAX_ORDERS = 100;
   const SERIAL_CONCURRENCY = 1;
@@ -1335,14 +1335,22 @@
     transitionTask(task, "custom_filling"); const fields = [];
     for (const mapping of CUSTOM_FIELDS) {
       const result = fieldResult(mapping); fields.push(result);
+      let control = null;
       try {
-        const control = uniqueControlInTask(task, mapping.dataPath); const expected = mapping.display ? mapping.display[task.order[mapping.key]] : task.order[mapping.key];
+        control = uniqueControlInTask(task, mapping.dataPath); const expected = mapping.display ? mapping.display[task.order[mapping.key]] : task.order[mapping.key];
         if (mapping.kind === "autocomplete") await fillScopedAutocomplete(control, String(expected), task);
         else await chooseScopedValue(control, String(expected), task);
         if (control.getAttribute("data-is-select") !== "1") throw new Error("网站未确认下拉选择");
         if (!normalizeText(readControl(control) || control.title).includes(normalizeText(expected))) throw new Error("选择后回读不一致");
         result.status = "verified";
-      } catch (error) { result.status = "failed"; result.error = errorMessage(error); result.fatal = Boolean(error?.fatal); break; }
+      } catch (error) {
+        result.status = "failed"; result.error = errorMessage(error); result.fatal = Boolean(error?.fatal);
+        // 单个字段阻塞不拖垮整单：非致命错误收掉残留下拉后继续填后面的字段，
+        // 批次暂停和 12 字段回读门禁在循环外照常生效，用户手工修单时只需补失败的那个字段。
+        if (result.fatal) break;
+        try { control?.blur(); } catch { /* 控件可能已不可用，忽略 */ }
+        await sleep(180);
+      }
     }
     task.fields = mergeFields(task.fields, fields);
     const failure = fields.find((item) => item.status !== "verified");
