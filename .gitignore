@@ -13,3 +13,20 @@ reports/
 .DS_Store
 Thumbs.db
 
+# Android / Gradle
+.gradle/
+build/
+**/build/
+local.properties
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Signing and secrets
+*.jks
+*.keystore
+keystore.properties
+secrets.properties
+google-services.json

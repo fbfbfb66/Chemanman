@@ -1,0 +1,23 @@
+{
+  "schema": "destination-dictionary/v1",
+  "generated_at": "2026-08-15T00:00:00.000Z",
+  "source": {
+    "site": "t800.chemanman.com",
+    "note": "随包内置，不做运行时同步。改动时必须同步油猴脚本顶部的 DESTINATIONS 常量（unique_key 要一致）"
+  },
+  "stations": [
+    { "unique_key": "xzqh_id_38010", "id": "38010", "name": "通海县", "type": 3, "adcode": "530423", "pname": "云南省", "cityname": "玉溪市", "adname": "通海县", "street": "", "showpname": "云南省玉溪市", "full_name": "云南省玉溪市通海县", "parent_key": "xzqh_id_37979", "aliases": ["通海"], "excluded": false, "exclude_reason": "" },
+    { "unique_key": "xzqh_id_37979", "id": "37979", "name": "玉溪市", "type": 2, "adcode": "530400", "pname": "云南省", "cityname": "玉溪市", "adname": "", "street": "", "showpname": "云南省", "full_name": "云南省玉溪市", "parent_key": null, "aliases": ["玉溪"], "excluded": false, "exclude_reason": "" },
+    { "unique_key": "xzqh_kw_玉溪", "id": "0", "name": "玉溪", "type": 4, "adcode": "", "pname": "", "cityname": "", "adname": "", "street": "玉溪", "showpname": "", "full_name": "玉溪", "parent_key": null, "aliases": [], "excluded": true, "exclude_reason": "not_in_use" },
+    { "unique_key": "xzqh_id_20277", "id": "20277", "name": "郑州市", "type": 2, "adcode": "410100", "pname": "河南省", "cityname": "郑州市", "adname": "", "street": "", "showpname": "河南省", "full_name": "河南省郑州市", "parent_key": null, "aliases": [], "excluded": true, "exclude_reason": "not_in_use" },
+    { "unique_key": "xzqh_kw_开航", "id": "0", "name": "开航", "type": 4, "adcode": "", "pname": "", "cityname": "", "adname": "", "street": "开航", "showpname": "", "full_name": "开航", "parent_key": null, "aliases": [], "excluded": true, "exclude_reason": "not_in_use" },
+    { "unique_key": "xzqh_id_37704", "id": "37704", "name": "昆明市", "type": 2, "adcode": "530100", "pname": "云南省", "cityname": "昆明市", "adname": "", "street": "", "showpname": "云南省", "full_name": "云南省昆明市", "parent_key": null, "aliases": [], "excluded": true, "exclude_reason": "origin" }
+  ],
+  "alias_index": {
+    "通海县": ["xzqh_id_38010"],
+    "通海": ["xzqh_id_38010"],
+    "玉溪市": ["xzqh_id_37979"],
+    "玉溪": ["xzqh_id_37979"]
+  },
+  "conflicts": []
+}
