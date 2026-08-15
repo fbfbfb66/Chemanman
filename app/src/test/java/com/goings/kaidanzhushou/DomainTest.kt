@@ -52,10 +52,20 @@ class DomainTest {
         assertEquals(4, controller.limit)
     }
 
+    @Test fun adaptiveConcurrencyDropsOnTimeoutButNotOnPermanentErrors() {
+        val controller = AdaptiveConcurrency()
+        controller.failure(KimiErrorKind.TIMEOUT)
+        assertEquals(2, controller.limit)
+        controller.failure(KimiErrorKind.TIMEOUT)
+        assertEquals(1, controller.limit)
+        controller.failure(KimiErrorKind.INVALID_RESPONSE)
+        assertEquals(1, controller.limit)
+    }
+
     @Test fun retriesOnlyTransientErrors() {
         assertTrue(RetryPolicy.isRetryable(KimiErrorKind.NETWORK))
         assertTrue(RetryPolicy.isRetryable(KimiErrorKind.RATE_LIMIT))
-        assertFalse(RetryPolicy.isRetryable(KimiErrorKind.TIMEOUT))
+        assertTrue(RetryPolicy.isRetryable(KimiErrorKind.TIMEOUT))
         assertFalse(RetryPolicy.isRetryable(KimiErrorKind.UNAUTHORIZED))
         assertTrue(RetryPolicy.pausesBatch(KimiErrorKind.QUOTA))
         assertEquals(4000, RetryPolicy.delayMillis(attempt = 3, jitter = 0))

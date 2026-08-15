@@ -40,7 +40,7 @@ class ImageStore(private val context: Context) {
         check(normalized.renameTo(original) || normalized.copyTo(original, overwrite = true).let { normalized.delete(); true })
         val upload = derivedFile(batchId, "upload", recordId)
         val thumbnail = derivedFile(batchId, "thumb", recordId)
-        resize(original, upload, 2200, 82)
+        resize(original, upload, 1600, 75)
         resize(original, thumbnail, 360, 78)
         return StoredImage(original, upload, thumbnail, inspect(thumbnail))
     }
