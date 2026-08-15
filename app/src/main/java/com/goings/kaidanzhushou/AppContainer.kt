@@ -17,7 +17,7 @@ import java.util.concurrent.TimeUnit
 
 class AppContainer(context: Context) {
     val database: KaidanDatabase = Room.databaseBuilder(context, KaidanDatabase::class.java, "kaidan.db")
-        .addMigrations(KaidanDatabase.MIGRATION_1_2)
+        .addMigrations(KaidanDatabase.MIGRATION_1_2, KaidanDatabase.MIGRATION_2_3)
         .build()
     val imageStore = ImageStore(context)
     val repository = BatchRepository(database, imageStore)

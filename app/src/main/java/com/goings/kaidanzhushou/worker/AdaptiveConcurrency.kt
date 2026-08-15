@@ -19,7 +19,7 @@ class AdaptiveConcurrency {
 
     @Synchronized
     fun failure(kind: KimiErrorKind) {
-        if (kind == KimiErrorKind.RATE_LIMIT) limit = when (limit) {
+        if (kind == KimiErrorKind.RATE_LIMIT || kind == KimiErrorKind.TIMEOUT) limit = when (limit) {
             4 -> 2
             else -> 1
         }
@@ -28,7 +28,7 @@ class AdaptiveConcurrency {
 }
 
 object RetryPolicy {
-    fun isRetryable(kind: KimiErrorKind) = kind in setOf(KimiErrorKind.NETWORK, KimiErrorKind.RATE_LIMIT, KimiErrorKind.SERVER)
+    fun isRetryable(kind: KimiErrorKind) = kind in setOf(KimiErrorKind.NETWORK, KimiErrorKind.RATE_LIMIT, KimiErrorKind.SERVER, KimiErrorKind.TIMEOUT)
     fun pausesBatch(kind: KimiErrorKind) = kind in setOf(KimiErrorKind.UNAUTHORIZED, KimiErrorKind.QUOTA, KimiErrorKind.PERMANENT)
     fun delayMillis(attempt: Int, serverMillis: Long? = null, jitter: Long = Random.nextLong(250, 1250)): Long {
         val exponential = (1_000.0 * 2.0.pow((attempt - 1).coerceIn(0, 5))).toLong()

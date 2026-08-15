@@ -72,10 +72,9 @@ fun CameraScreen(viewModel: MainViewModel, batchId: String, onDone: () -> Unit) 
     val providerFuture = remember { ProcessCameraProvider.getInstance(context) }
 
     DisposableEffect(activity) {
-        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
         onDispose { activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT }
     }
-    LaunchedEffect(landscape) { if (landscape) activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR }
     LaunchedEffect(Unit) { if (!granted) permission.launch(Manifest.permission.CAMERA) }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
@@ -125,7 +124,7 @@ fun CameraScreen(viewModel: MainViewModel, batchId: String, onDone: () -> Unit) 
         error?.let {
             Text(it, color = Color.White, modifier = Modifier.align(Alignment.TopCenter).padding(top = 82.dp).background(Color(0xCCD92E2E), CircleShape).padding(horizontal = 14.dp, vertical = 7.dp))
         }
-        ShutterButton(capturing || records.size >= 100, Modifier.align(if (landscape) Alignment.CenterEnd else Alignment.BottomCenter).padding(if (landscape) 30.dp else 34.dp)) {
+        ShutterButton(capturing || records.size >= 100, Modifier.align(Alignment.CenterEnd).padding(end = 32.dp)) {
             val capture = imageCapture ?: return@ShutterButton
             capturing = true
             error = null

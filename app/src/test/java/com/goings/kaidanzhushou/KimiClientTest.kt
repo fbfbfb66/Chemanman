@@ -88,18 +88,40 @@ class KimiClientTest {
         }
     }
 
-    @Test fun timeoutAutomaticallyResendsOnce() {
+    @Test fun timeoutIsReportedOnceAndLeftToTheWorkerToRetry() {
         runBlocking {
         val server = MockWebServer(); server.start()
         try {
             val chunk = "data: {\"choices\":[{\"delta\":{\"content\":${Json.encodeToString(payload)}}}]}\n\ndata: [DONE]\n\n"
-            server.enqueue(MockResponse().setResponseCode(200).setBody(chunk).setBodyDelay(300, TimeUnit.MILLISECONDS))
+            repeat(2) { server.enqueue(MockResponse().setResponseCode(200).setBody(chunk).setBodyDelay(5, TimeUnit.SECONDS)) }
+            val file = File.createTempFile("waybill", ".jpg").apply { writeBytes(byteArrayOf(1, 2, 3)) }
+            val client = KimiClient(
+                OkHttpClient(),
+                baseUrl = server.url("/v1/").toString(),
+                requestTimeoutMillis = 300,
+                hedgeAfterMillis = 100,
+            )
+
+            val error = runCatching { client.recognize("test", file) }.exceptionOrNull() as KimiException
+            assertEquals(KimiErrorKind.TIMEOUT, error.kind)
+            file.delete()
+        } finally { server.shutdown() }
+        }
+    }
+
+    @Test fun stalledRequestIsHedgedAndTheFasterCopyWins() {
+        runBlocking {
+        val server = MockWebServer(); server.start()
+        try {
+            val chunk = "data: {\"choices\":[{\"delta\":{\"content\":${Json.encodeToString(payload)}}}]}\n\ndata: [DONE]\n\n"
+            server.enqueue(MockResponse().setResponseCode(200).setBody(chunk).setBodyDelay(4, TimeUnit.SECONDS))
             server.enqueue(MockResponse().setResponseCode(200).setBody(chunk))
             val file = File.createTempFile("waybill", ".jpg").apply { writeBytes(byteArrayOf(1, 2, 3)) }
             val client = KimiClient(
                 OkHttpClient(),
                 baseUrl = server.url("/v1/").toString(),
-                requestTimeoutMillis = 100,
+                requestTimeoutMillis = 30_000,
+                hedgeAfterMillis = 200,
             )
 
             assertEquals("杭州", client.recognize("test", file).destination_text)
@@ -107,6 +129,77 @@ class KimiClientTest {
             file.delete()
         } finally { server.shutdown() }
         }
+    }
+
+    @Test fun healthyRequestIsNotHedged() {
+        runBlocking {
+        val server = MockWebServer(); server.start()
+        try {
+            val chunk = "data: {\"choices\":[{\"delta\":{\"content\":${Json.encodeToString(payload)}}}]}\n\ndata: [DONE]\n\n"
+            server.enqueue(MockResponse().setResponseCode(200).setBody(chunk))
+            val file = File.createTempFile("waybill", ".jpg").apply { writeBytes(byteArrayOf(1, 2, 3)) }
+            val client = KimiClient(OkHttpClient(), baseUrl = server.url("/v1/").toString(), hedgeAfterMillis = 200)
+
+            assertEquals("杭州", client.recognize("test", file).destination_text)
+            assertEquals(1, server.requestCount)
+            file.delete()
+        } finally { server.shutdown() }
+        }
+    }
+
+    @Test fun streamingResponseSuppressesHedgeEvenWhenSlowToFinish() {
+        runBlocking {
+        val server = MockWebServer(); server.start()
+        try {
+            val head = payload.substring(0, 20)
+            val tail = payload.substring(20)
+            // 首个分片很快到达，之后是一长串空 content 事件，整流直到远超对冲窗口才结束。
+            // 节流是双向的，2KB/250ms 让请求体上传只占一两个周期，慢的是响应而不是上传。
+            val filler = "data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n".repeat(800)
+            val sse = "data: {\"choices\":[{\"delta\":{\"content\":${Json.encodeToString(head)}}}]}\n\n" + filler +
+                "data: {\"choices\":[{\"delta\":{\"content\":${Json.encodeToString(tail)}}}]}\n\n" + "data: [DONE]\n\n"
+            server.enqueue(
+                MockResponse().setResponseCode(200).setBody(sse)
+                    .throttleBody(2048, 250, TimeUnit.MILLISECONDS)
+            )
+            val file = File.createTempFile("waybill", ".jpg").apply { writeBytes(byteArrayOf(1, 2, 3)) }
+            val client = KimiClient(
+                OkHttpClient(),
+                baseUrl = server.url("/v1/").toString(),
+                requestTimeoutMillis = 30_000,
+                hedgeAfterMillis = 2_500,
+            )
+
+            assertEquals("杭州", client.recognize("test", file).destination_text)
+            assertEquals(1, server.requestCount)
+            file.delete()
+        } finally { server.shutdown() }
+        }
+    }
+
+    @Test fun fastPermanentFailureIsNotHedged() {
+        runBlocking {
+        val server = MockWebServer(); server.start()
+        try {
+            server.enqueue(MockResponse().setResponseCode(401))
+            val file = File.createTempFile("waybill", ".jpg")
+            val client = KimiClient(OkHttpClient(), baseUrl = server.url("/").toString(), hedgeAfterMillis = 200)
+            val error = runCatching { client.recognize("test", file) }.exceptionOrNull() as KimiException
+            assertEquals(KimiErrorKind.UNAUTHORIZED, error.kind)
+            assertEquals(1, server.requestCount)
+            file.delete()
+        } finally { server.shutdown() }
+        }
+    }
+
+    @Test fun firstContentChunkIsSignalledOnce() {
+        val json = Json
+        val sse = "data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"content\":${json.encodeToString("甲")}}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"content\":${json.encodeToString("乙")}}}]}\n\n" + "data: [DONE]\n\n"
+        var signals = 0
+        assertEquals("甲乙", SseContentParser().parse(Buffer().writeUtf8(sse)) { signals++ })
+        assertEquals(1, signals)
     }
 
     @Test fun classifiesPermanentQuotaServerAndNetworkFailures() {

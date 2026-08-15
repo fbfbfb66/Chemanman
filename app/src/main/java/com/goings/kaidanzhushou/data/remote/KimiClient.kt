@@ -3,8 +3,17 @@ package com.goings.kaidanzhushou.data.remote
 import com.goings.kaidanzhushou.BuildConfig
 import com.goings.kaidanzhushou.domain.RecognitionDraft
 import com.goings.kaidanzhushou.domain.PaymentType
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.job
+import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
@@ -25,6 +34,7 @@ import java.io.IOException
 import java.io.InterruptedIOException
 import java.util.Base64
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.coroutineContext
 
 enum class KimiErrorKind { UNAUTHORIZED, QUOTA, RATE_LIMIT, SERVER, NETWORK, TIMEOUT, PERMANENT, INVALID_RESPONSE }
 
@@ -38,54 +48,100 @@ class KimiClient(
     private val http: OkHttpClient,
     private val json: Json = Json { ignoreUnknownKeys = true; explicitNulls = false },
     private val baseUrl: String = BuildConfig.KIMI_BASE_URL,
-    private val requestTimeoutMillis: Long = 15_000,
+    private val requestTimeoutMillis: Long = 40_000,
+    private val hedgeAfterMillis: Long = 12_000,
+    maxConcurrentHedges: Int = 2,
 ) {
+    private val hedgePermits = Semaphore(maxConcurrentHedges)
+
+    /**
+     * 识别请求呈双峰分布：正常约 10s 完成，卡住的那条再等也不会好。
+     * 因此在 [hedgeAfterMillis] 内既没完成、也没开始吐字时，并发补发一个请求，谁先成功用谁，输的一方立刻取消。
+     * 整个过程封在客户端内部：不改状态机、不加 attemptCount、不写 RETRY_WAIT，上层与用户无感。
+     */
     suspend fun recognize(apiKey: String, image: File): RecognitionDraft = withContext(Dispatchers.IO) {
-        val request = Request.Builder()
-            .url("${baseUrl}chat/completions")
-            .header("Authorization", "Bearer $apiKey")
-            .header("Accept", "text/event-stream")
-            .post(requestBody(image).toString().toRequestBody(JSON_MEDIA))
-            .build()
-        for (sendAttempt in 0..1) {
-            try {
-                val call = http.newCall(request)
-                call.timeout().timeout(requestTimeoutMillis, TimeUnit.MILLISECONDS)
-                call.execute().use { response ->
-                    if (!response.isSuccessful) {
-                        val safeMessage = when (response.code) {
-                            401 -> "API Key 无效或已失效"
-                            402 -> "Kimi 账户余额不足"
-                            429 -> "请求过于频繁，稍后自动重试"
-                            in 500..599 -> "Kimi 服务暂时不可用"
-                            else -> "Kimi 请求参数错误（${response.code}）"
-                        }
-                        val bodyHint = response.body?.string().orEmpty().lowercase()
-                        val kind = when {
-                            response.code == 401 -> KimiErrorKind.UNAUTHORIZED
-                            response.code == 402 || "balance" in bodyHint || "quota" in bodyHint || "余额" in bodyHint -> KimiErrorKind.QUOTA
-                            response.code == 429 -> KimiErrorKind.RATE_LIMIT
-                            response.code >= 500 -> KimiErrorKind.SERVER
-                            else -> KimiErrorKind.PERMANENT
-                        }
-                        val retry = response.header("Retry-After")?.toDoubleOrNull()?.times(1000)?.toLong()
-                        throw KimiException(kind, safeMessage, retry)
-                    }
-                    val body = response.body ?: throw KimiException(KimiErrorKind.INVALID_RESPONSE, "Kimi 返回空响应")
-                    val content = SseContentParser(json).parse(body.source())
-                    return@withContext parseDraft(content)
+        val request = request(apiKey, image)
+        coroutineScope {
+            val streaming = CompletableDeferred<Unit>()
+            val primary = async { attempt(request) { streaming.complete(Unit) } }
+            // 首字节到达或请求已结束都说明无需对冲；只有静默超过窗口才补发。
+            val stalled = withTimeoutOrNull(hedgeAfterMillis) {
+                select {
+                    primary.onAwait { false }
+                    streaming.onAwait { false }
                 }
-            } catch (error: KimiException) {
-                throw error
-            } catch (_: InterruptedIOException) {
-                if (sendAttempt == 0) continue
-                throw KimiException(KimiErrorKind.TIMEOUT, "AI 识别超时，已自动重试一次")
-            } catch (_: IOException) {
-                throw KimiException(KimiErrorKind.NETWORK, "网络连接失败")
+            } ?: true
+            // 名额耗尽时老实等原请求，避免大面积卡顿下在途请求翻倍。
+            if (!stalled || !hedgePermits.tryAcquire()) return@coroutineScope primary.await().getOrThrow()
+            try {
+                val hedge = async { attempt(request) {} }
+                val (settled, other) = select<Pair<Result<RecognitionDraft>, Deferred<Result<RecognitionDraft>>>> {
+                    primary.onAwait { it to hedge }
+                    hedge.onAwait { it to primary }
+                }
+                if (settled.isSuccess) settled.getOrThrow()
+                else other.await().getOrElse { throw settled.exceptionOrNull()!! }
+            } finally {
+                hedgePermits.release()
             }
         }
-        throw KimiException(KimiErrorKind.TIMEOUT, "AI 识别超时，已自动重试一次")
     }
+
+    private suspend fun attempt(request: Request, onStreamStart: () -> Unit): Result<RecognitionDraft> = try {
+        Result.success(execute(request, onStreamStart))
+    } catch (cancellation: CancellationException) {
+        throw cancellation
+    } catch (error: KimiException) {
+        Result.failure(error)
+    }
+
+    private suspend fun execute(request: Request, onStreamStart: () -> Unit): RecognitionDraft {
+        val call = http.newCall(request)
+        call.timeout().timeout(requestTimeoutMillis, TimeUnit.MILLISECONDS)
+        // 落败方被取消时立刻断开 socket，不让它继续占用上行带宽。
+        val cancelOnLoss = coroutineContext.job.invokeOnCompletion { cause -> if (cause != null) call.cancel() }
+        try {
+            call.execute().use { response ->
+                if (!response.isSuccessful) {
+                    val safeMessage = when (response.code) {
+                        401 -> "API Key 无效或已失效"
+                        402 -> "Kimi 账户余额不足"
+                        429 -> "请求过于频繁，稍后自动重试"
+                        in 500..599 -> "Kimi 服务暂时不可用"
+                        else -> "Kimi 请求参数错误（${response.code}）"
+                    }
+                    val bodyHint = response.body?.string().orEmpty().lowercase()
+                    val kind = when {
+                        response.code == 401 -> KimiErrorKind.UNAUTHORIZED
+                        response.code == 402 || "balance" in bodyHint || "quota" in bodyHint || "余额" in bodyHint -> KimiErrorKind.QUOTA
+                        response.code == 429 -> KimiErrorKind.RATE_LIMIT
+                        response.code >= 500 -> KimiErrorKind.SERVER
+                        else -> KimiErrorKind.PERMANENT
+                    }
+                    val retry = response.header("Retry-After")?.toDoubleOrNull()?.times(1000)?.toLong()
+                    throw KimiException(kind, safeMessage, retry)
+                }
+                val body = response.body ?: throw KimiException(KimiErrorKind.INVALID_RESPONSE, "Kimi 返回空响应")
+                val content = SseContentParser(json).parse(body.source(), onStreamStart)
+                return parseDraft(content)
+            }
+        } catch (error: KimiException) {
+            throw error
+        } catch (_: InterruptedIOException) {
+            throw KimiException(KimiErrorKind.TIMEOUT, "AI 识别超时，稍后自动重试")
+        } catch (_: IOException) {
+            throw KimiException(KimiErrorKind.NETWORK, "网络连接失败")
+        } finally {
+            cancelOnLoss.dispose()
+        }
+    }
+
+    private fun request(apiKey: String, image: File): Request = Request.Builder()
+        .url("${baseUrl}chat/completions")
+        .header("Authorization", "Bearer $apiKey")
+        .header("Accept", "text/event-stream")
+        .post(requestBody(image).toString().toRequestBody(JSON_MEDIA))
+        .build()
 
     internal fun parseDraft(content: String): RecognitionDraft = try {
         val objectValue = json.parseToJsonElement(content).jsonObject

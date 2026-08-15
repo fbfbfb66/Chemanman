@@ -77,6 +77,10 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         runCatching { container.repository.updateFields(id, fields, changed) }.onFailure(::error)
     }
 
+    fun updateRotation(id: String, rotationDegrees: Int) = viewModelScope.launch {
+        runCatching { container.repository.updateRotation(id, rotationDegrees) }.onFailure(::error)
+    }
+
     fun confirmRecord(id: String, done: () -> Unit) = viewModelScope.launch {
         val issues = container.repository.confirm(id)
         if (issues.isEmpty()) { _events.emit(UiNotice.success("已确认")); done() } else _events.emit(UiNotice.warning(issues.joinToString("；")))
