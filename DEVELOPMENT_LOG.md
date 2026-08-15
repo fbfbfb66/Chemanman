@@ -906,3 +906,35 @@ v1.4.2 修的是整个面板内容的滚动（`.scroll` 补 `min-height:0`），
 
 1. 实站确认：12 条订单展开明细后，表格在明细框内滚动、窗口总高不再被撑到 86vh 上限。
 2. 沟通教训：用户说「明细无法滚动」时指的是**明细框内部滚动**，v1.4.2 修成了外层容器滚动。涉及「滚动」的需求先确认滚动的主体是谁。
+
+---
+
+## TASK-20260815-004：v1.5.0 保存后创建门控信号化（废弃固定 6s 冷却）
+
+### 1. 任务目标
+
+固定 6s 冷却（`POST_SAVE_COOLDOWN_MS`）是经验值盲猜：v1.0.6 时代 3s 在慢网翻过车才改成 6s，但没有证据表明 6s 在更差网络下依然够，快网下又每单白等约 3.5s。目标：用页面自身信号替代盲等，慢网自适应顺延。
+
+### 2. 信号依据（先探针、后动手）
+
+- 10 个历史 HAR 复盘：每次保存成功（coHandle errno=0）后页面自身必发 `POST /api/Order/Order/oinfo/`，延迟 2.13~2.18s；唯一一次 errno=320（未保存成功）则不发。
+- 实站探针（`script/保存后创建时机探针.user.js`，只读观察）跑 12 单：oinfo 12/12 命中，延迟 2171~2289ms；oinfo 前后 ±150ms 是保存后异步 DOM 刷新窗口；oinfo 落定后再约 500ms 页面 DOM 进入持续安静（+2.8s 起连续 3.9s 零变更）；旧 6s 冷却实际 +6.7s 才点创建。
+- 结论：「oinfo 响应 errno=0 + DOM 连续 500ms 无结构变更」作为创建门控，每个条件都对应实测机制；不存在单一"绝对安全"信号，网站不发布此类事件。
+
+### 3. 修正
+
+- `waitForPostSaveCooldown` → `waitForPostSaveReady`：oinfo 信号已收到且 DOM 安静 500ms 即放行（实测约 3s，每单省约 3.5s）；最长等 `POST_SAVE_SIGNAL_TIMEOUT_MS = 10000`，超时放行走 `timeout_fallback` 并写诊断 `post_save_ready`（不阻断批次，信号失效可从事后诊断发现）。
+- 页面观察者新增 oinfo 匹配（仅响应侧：Response.json/text 与 XHR loadend，事件带 `signal: "oinfo"`）；oinfo 不发 request 事件、不进保存许可归因，coHandle 保存链路字节级不变。
+- 新增常驻 MutationObserver（childList+subtree，过滤面板自身）只更新 `state.lastDomMutationAt`，供安静判定；信号时间戳为瞬态，不进检查点（刷新恢复后自然走超时路径，行为等同旧版）。
+- 500ms 创建按钮稳定检测等下游校验原样保留，作为独立最后一道门。
+- 探针脚本与分析脚本（`.codex-work/analyze_har.py`、`analyze_probe.py`）留库作后续验证工具。
+
+### 4. 验证
+
+- `deno check` 通过；`destination.test.mjs`、`payment-schema.test.mjs` 全绿（版本断言同步 1.5.0；该断言在 v1.4.4 时漏同步，本次一并修正）。
+- **实站验证通过**（用户确认）：创建等待不再是固定 6s，而是随网络状况动态调整的信号门控，批次正常完成。
+
+### 5. 下次注意事项
+
+1. 实站回归若发现 `post_save_ready` 持续走 `timeout_fallback`，说明网站改版 oinfo 信号消失，需重新找信号（探针仍在库里，直接复用）。
+2. 门控只缩短/顺延等待，不放宽任何下游校验；出现创建异常时先查诊断时间线里 `post_save_ready` 与 `create_entry_stable` 的间隔。

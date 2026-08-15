@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         车满满批量串行自动填写保存
 // @namespace    codex.chemanman.batch-serial.production
-// @version      1.4.4
+// @version      1.5.0
 // @description  从本地 XLSX 严格逐条填写保存。兼容 Schema v1.1 的现付、到付和回付，串行保存逻辑保持不变。支持导出常用到站字典供手机 App 使用。
 // @author       User
 // @match        https://t800.chemanman.com/Order*
@@ -12,7 +12,7 @@
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "1.4.4";
+  const SCRIPT_VERSION = "1.5.0";
   const CHECKPOINT_VERSION = 3;
   const MAX_ORDERS = 100;
   const SERIAL_CONCURRENCY = 1;
@@ -44,7 +44,10 @@
   const SAVE_BUTTON_TEXT = /^(保存(?:\(F9\))?|保存并打印|保存并关闭|提交运单|继续保存)$/i;
   const DIAGNOSTIC_SCHEMA_VERSION = 1;
   const DIAGNOSTIC_EVENT_LIMIT = 500;
-  const POST_SAVE_COOLDOWN_MS = 6000;
+  // 保存后创建门控（v1.5.0）：不再固定盲等，改为等页面自身的 oinfo 信号 + DOM 安静窗口；
+  // 超时放行作为兜底（不阻断批次），走哪条路径都会写诊断 post_save_ready。
+  const POST_SAVE_SIGNAL_TIMEOUT_MS = 10000;
+  const DOM_QUIET_WINDOW_MS = 500;
   // 慢网络超时配置（v1.2.0 放宽）：只推迟失败判定，成功路径在条件满足时立即返回。
   const SAVE_RESULT_TIMEOUT_MS = 60000;
   const SAVE_REQUEST_SEEN_TIMEOUT_MS = 10000;
@@ -103,6 +106,7 @@
     running: false, batchStarted: false, pauseRequested: false, stopRequested: false, globalHalt: "",
     authorization: false, safetyBlocks: 0, savePermit: null, clickPermitId: "", baselineTabs: new WeakSet(),
     recovered: false, legacyCheckpoint: false, completed: false, reportExported: false, ui: null,
+    postSaveOinfoSettledAt: 0, lastDomMutationAt: 0,
     diagnostics: { session_id: stableHash(`${Date.now()}-${Math.random()}`), started_at: now(), bridge_ready: false, events: [] },
   };
   let operationMutex = Promise.resolve();
@@ -111,8 +115,32 @@
 
   installPageNetworkObserver();
   installSafetyGuards();
+  installDomQuietTracker();
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", initializeUi, { once: true });
   else initializeUi();
+
+  // 保存后创建门控的 DOM 安静追踪：常驻观察页面结构变更，只更新时间戳，不做其他事。
+  // 面板自身的变更必须排除，否则脚本的状态渲染会永远打断"安静"判定。
+  function installDomQuietTracker() {
+    if (typeof MutationObserver !== "function") return;
+    const attach = () => {
+      if (!document.documentElement) return false;
+      new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+          if (mutation.target instanceof Element && mutation.target.closest?.(`#${PANEL_ID}`)) continue;
+          state.lastDomMutationAt = Date.now();
+          break;
+        }
+      }).observe(document.documentElement, { childList: true, subtree: true });
+      return true;
+    };
+    if (attach()) return;
+    const waiter = new MutationObserver(() => {
+      if (!attach()) return;
+      waiter.disconnect();
+    });
+    waiter.observe(document, { childList: true, subtree: true });
+  }
 
   function installPageNetworkObserver() {
     window.addEventListener?.(BRIDGE_EVENT, handlePageObserverEvent);
@@ -141,6 +169,8 @@
     if (window[marker]?.addChannel) { window[marker].addChannel(eventName); return; }
     const channels = new Set([eventName]);
     const match = (value) => /\/api\/Order\/Order\/coHandle(?:\/|\?|$)/i.test(String(value || ""));
+    // 保存后创建门控信号：保存成功后页面自身会拉取已存运单信息，响应落定即"保存后流程已执行"。
+    const matchOinfo = (value) => /\/api\/Order\/Order\/oinfo(?:\/|\?|$)/i.test(String(value || ""));
     const hash = (value) => { let output = 2166136261; for (const char of String(value)) { output ^= char.charCodeAt(0); output = Math.imul(output, 16777619); } return `fnv1a-${(output >>> 0).toString(16).padStart(8, "0")}`; };
     const emit = (type, detail = {}) => {
       for (const channel of channels) window.dispatchEvent(new CustomEvent(channel, { detail: { type, ...detail } }));
@@ -187,9 +217,12 @@
       if (typeof original !== "function" || original.__cmPageObserved) continue;
       const observed = function observedResponseBody(...args) {
         const response = this; const result = original.apply(response, args);
-        if (!match(response?.url)) return result;
+        const url = response?.url;
+        if (!match(url) && !matchOinfo(url)) return result;
+        // coHandle 永不命中 oinfo 匹配，保存事件保持原样不带 signal 字段。
+        const signal = matchOinfo(url) ? { signal: "oinfo" } : {};
         return Promise.resolve(result).then((value) => {
-          emit("response_body", describe(response.status, value, `response.${method}`, response.url, response.headers?.get?.("content-type") || ""));
+          emit("response_body", { ...signal, ...describe(response.status, value, `response.${method}`, response.url, response.headers?.get?.("content-type") || "") });
           return value;
         }, (error) => { emit("body_read_error", { source: `response.${method}`, status: response?.status || 0, error: String(error?.message || error).slice(0, 240) }); throw error; });
       };
@@ -201,11 +234,14 @@
       const originalOpen = xhrPrototype.open; const originalSend = xhrPrototype.send;
       xhrPrototype.open = function observedOpen(method, url, ...rest) { this.__cmPageSaveUrl = String(url || ""); return originalOpen.call(this, method, url, ...rest); };
       xhrPrototype.send = function observedSend(body) {
-        if (!match(this.__cmPageSaveUrl)) return originalSend.call(this, body);
-        const id = requestId(); emit("request", { request_id: id, transport: "page-xhr", path: (() => { try { return new URL(this.__cmPageSaveUrl, location.href).pathname; } catch { return ""; } })() });
+        const isSave = match(this.__cmPageSaveUrl); const isOinfo = !isSave && matchOinfo(this.__cmPageSaveUrl);
+        if (!isSave && !isOinfo) return originalSend.call(this, body);
+        const id = requestId();
+        // oinfo 不发 request 事件：只取响应落定时刻，避免误入保存许可归因。
+        if (isSave) emit("request", { request_id: id, transport: "page-xhr", path: (() => { try { return new URL(this.__cmPageSaveUrl, location.href).pathname; } catch { return ""; } })() });
         this.addEventListener("loadend", () => {
           let value = ""; try { value = typeof this.responseText === "string" ? this.responseText : ""; } catch { /* metadata only */ }
-          emit("response_body", { request_id: id, transport: "page-xhr", ...describe(this.status, value, "xhr.loadend", this.responseURL || this.__cmPageSaveUrl, this.getResponseHeader?.("content-type") || "") });
+          emit("response_body", { request_id: id, transport: "page-xhr", ...(isOinfo ? { signal: "oinfo" } : {}), ...describe(this.status, value, "xhr.loadend", this.responseURL || this.__cmPageSaveUrl, this.getResponseHeader?.("content-type") || "") });
         }, { once: true });
         return originalSend.call(this, body);
       };
@@ -221,6 +257,14 @@
     if (detail.type === "ready") state.diagnostics.bridge_ready = true;
     const permit = state.savePermit;
     recordDiagnostic(`page_${detail.type || "unknown"}`, detail, permit?.taskId || "");
+    // oinfo 信号与保存许可无关：只记录落定时刻供创建门控使用，绝不进入 permit 归因。
+    if (detail.signal === "oinfo") {
+      if (detail.type === "response_body" && Number(detail.errno) === 0) {
+        state.postSaveOinfoSettledAt = Date.now();
+        recordDiagnostic("post_save_oinfo_settled", { channel: detail.source || detail.transport || "", http_status: Number(detail.status) || "" });
+      }
+      return;
+    }
     if (!permit || permit.status === "settled") return;
     if (detail.type === "request") {
       permit.bridgeRequestId = detail.request_id || permit.bridgeRequestId || "";
@@ -1067,7 +1111,7 @@
       transitionTask(task, "direct_filling");
       return;
     }
-    await waitForPostSaveCooldown(task);
+    await waitForPostSaveReady(task);
     transitionTask(task, "waiting_create_entry", "等待网站保存后页面稳定和创建入口就绪");
     const beforeTabs = new Set(listTabElements()); const previous = getActiveTab();
     const action = await waitForStableCreateOrderAction(CREATE_ENTRY_TIMEOUT_MS, 500);
@@ -1098,12 +1142,28 @@
     transitionTask(task, "direct_filling");
   }
 
-  async function waitForPostSaveCooldown(task) {
+  // 保存后创建门控：等页面自身的 oinfo 信号（errno=0，证明保存后流程已执行）且 DOM 连续
+  // DOM_QUIET_WINDOW_MS 无结构变更（证明其引发的异步刷新已完成），二者齐备即放行。
+  // 快网实测约 3s 放行；慢网自动顺延，最长 POST_SAVE_SIGNAL_TIMEOUT_MS，超时放行并写诊断。
+  async function waitForPostSaveReady(task) {
     const previous = [...state.tasks].filter((item) => item.index < task.index && item.state === "saved").sort((a, b) => b.index - a.index)[0];
-    if (!previous?.saveSettledAt) return;
-    const elapsed = Date.now() - Date.parse(previous.saveSettledAt); const remaining = Math.max(0, POST_SAVE_COOLDOWN_MS - (Number.isFinite(elapsed) ? elapsed : 0));
-    recordDiagnostic("post_save_cooldown", { previous_record_id: previous.order.source_record_id, configured_ms: POST_SAVE_COOLDOWN_MS, elapsed_ms: Math.max(0, elapsed || 0), remaining_ms: remaining }, task.id);
-    if (remaining) await sleep(remaining);
+    const saveSettledMs = Date.parse(previous?.saveSettledAt || "");
+    if (!previous || !Number.isFinite(saveSettledMs)) return;
+    const startedMs = Date.now();
+    const deadline = startedMs + POST_SAVE_SIGNAL_TIMEOUT_MS;
+    while (true) {
+      const oinfoSeen = state.postSaveOinfoSettledAt > saveSettledMs;
+      const quietSeen = state.lastDomMutationAt > 0 && Date.now() - state.lastDomMutationAt >= DOM_QUIET_WINDOW_MS;
+      if (oinfoSeen && quietSeen) {
+        recordDiagnostic("post_save_ready", { path: "signal", previous_record_id: previous.order.source_record_id, waited_ms: Date.now() - startedMs, since_save_settled_ms: Date.now() - saveSettledMs }, task.id);
+        return;
+      }
+      if (Date.now() >= deadline) {
+        recordDiagnostic("post_save_ready", { path: "timeout_fallback", oinfo_seen: oinfoSeen, quiet_seen: quietSeen, previous_record_id: previous.order.source_record_id, waited_ms: Date.now() - startedMs }, task.id);
+        return;
+      }
+      await sleep(100);
+    }
   }
 
   function bindTaskToForm(task, tab, root, origin) {
