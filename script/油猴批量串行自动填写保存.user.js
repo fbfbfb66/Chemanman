@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         车满满批量串行自动填写保存
 // @namespace    codex.chemanman.batch-serial.production
-// @version      1.4.0
+// @version      1.4.3
 // @description  从本地 XLSX 严格逐条填写保存。兼容 Schema v1.1 的现付、到付和回付，串行保存逻辑保持不变。支持导出常用到站字典供手机 App 使用。
 // @author       User
 // @match        https://t800.chemanman.com/Order*
@@ -12,7 +12,7 @@
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "1.4.0";
+  const SCRIPT_VERSION = "1.4.3";
   const CHECKPOINT_VERSION = 3;
   const MAX_ORDERS = 100;
   const SERIAL_CONCURRENCY = 1;
@@ -737,7 +737,7 @@
         .bar .sp{flex:1}
         .iconbtn{border:0;background:rgba(255,255,255,.14);color:#fff;border-radius:8px;padding:5px 11px;font:13px/1.4 inherit;cursor:pointer}
         .iconbtn:hover{background:rgba(255,255,255,.26)}
-        .scroll{flex:1;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:14px}
+        .scroll{flex:1;min-height:0;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:14px}
         .stage{display:flex;flex-direction:column;gap:14px}
         #recoverBar{order:-2}#stageManual{order:-1}
         .card{border:1px solid #e5e7eb;border-radius:12px;padding:16px;background:#fff}
@@ -786,7 +786,7 @@
         .tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
         .tools .sp{flex:1}
         select{border:1px solid #d5dbe3;border-radius:8px;padding:6px 9px;font:13px/1.4 inherit;background:#fff;color:#1f2933}
-        .tablewrap{overflow-x:auto;margin-top:10px}
+        .tablewrap{overflow:auto;margin-top:10px;max-height:320px}
         table{width:100%;border-collapse:collapse;font-size:12.5px}
         th{text-align:left;padding:7px 8px;background:#f1f5f9;color:#475569;font-weight:600;white-space:nowrap}
         td{padding:8px;border-bottom:1px solid #eef2f6;vertical-align:top;word-break:break-word}
@@ -1364,7 +1364,12 @@
       selected = await chooseNewExactOption(value, before, DATALIST_RETRY_POLL_MS, control, task, { attemptStartedAt });
     }
     if (!selected) throw new Error(`未找到唯一候选：${value}`);
-    await waitFor(() => control.getAttribute("data-is-select") === "1" && normalizeText(readControl(control) || control.title) === normalizeText(value), DATALIST_CONFIRM_TIMEOUT_MS, `候选点击后网站未确认：${value}`);
+    // 确认以网站自己的选中标志为准：候选在点击前已按文本核验过，点击后只要网站置了
+    // data-is-select 且控件有非空回显，就算填写成功。不再要求回显与输入串逐字相等——
+    // 网站常把名字补全成标准行政区划（如输入「杭州」、选中后回显「杭州市」），
+    // 严格相等会把已经选对的单子误判成失败。回显与输入完全无关的情况仍由后续
+    // fillCustomFields 的 includes 回读校验兜底。
+    await waitFor(() => control.getAttribute("data-is-select") === "1" && Boolean(normalizeText(readControl(control) || control.title)), DATALIST_CONFIRM_TIMEOUT_MS, `候选点击后网站未确认：${value}`);
     verifyDestinationKeyAttribute(control, task);
   }
 
@@ -1447,7 +1452,9 @@
       const visibleDropdownMenus = allDropdownMenus.filter(isVisible);
       const exact = [...document.body.querySelectorAll("*")].filter((element) => !element.closest(`#${PANEL_ID}`) && !control.contains(element) && isVisible(element) && normalizeText(element.textContent) === normalizeText(value));
       const dropdownExact = exact.filter((element) => visibleDropdownMenus.some((menu) => menu === element || menu.contains(element)));
-      if (control.getAttribute("data-is-select") === "1" && normalizeText(readControl(control) || control.title) === normalizeText(value)) {
+      // 自动确认同样只认网站的选中标志：data-is-select 在轮询前已被重置，
+      // 轮询期间被置 1 且有非空回显，就是网站对本次输入做了确认，直接采信。
+      if (control.getAttribute("data-is-select") === "1" && normalizeText(readControl(control) || control.title)) {
         recordDiagnostic("candidate_auto_confirmed", {
           field: control.getAttribute("data-path") || "", dropdown_menu_total: allDropdownMenus.length,
           dropdown_menu_visible: visibleDropdownMenus.length, dropdown_menu_exact: dropdownExact.length, value_hash: stableHash(value),
@@ -2524,7 +2531,13 @@
     }
     if (stage === "running" && manualTask) {
       const [title, hint] = taskTrouble(manualTask);
-      const missing = manualTask.fields.filter((field) => field.status !== "verified").map((field) => FIELD_LABEL[field.key] || field.key);
+      // 对不上的项目要带上「应为什么」，否则用户不知道要改成什么样——期望值就是表格里的值（枚举走显示名）。
+      const missing = manualTask.fields.filter((field) => field.status !== "verified").map((field) => {
+        const label = FIELD_LABEL[field.key] || field.key;
+        const mapping = FIELD_MAPPINGS.find((item) => item.key === field.key);
+        const expected = mapping ? (mapping.display ? mapping.display[manualTask.order[mapping.key]] : manualTask.order[mapping.key]) : "";
+        return isBlank(expected) ? label : `${label}（应为：${expected}）`;
+      });
       el.manualTitle.textContent = title;
       el.manualHint.textContent = hint;
       el.manualWho.innerHTML = `订单 <b>${escapeHtml(manualTask.order.source_record_id)}</b> · 到 ${escapeHtml(manualTask.order.destination_text)} · ${escapeHtml(manualTask.order.receiver_name)}`

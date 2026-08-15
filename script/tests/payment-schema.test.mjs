@@ -24,7 +24,7 @@ vm.createContext(context);
 vm.runInContext(source, context, { filename: scriptUrl.pathname });
 const api = context.window.__CMBatchSerial;
 
-assert.equal(api.version, "1.4.0");
+assert.equal(api.version, "1.4.3");
 assert.equal(api.concurrency, 1, "兼容升级不得改变串行保存");
 const base = {
   __rowNumber: 2, __formulaFields: [], schema_version: "v1.1", batch_id: "B-1", source_record_id: "R-1",
