@@ -1,9 +1,13 @@
 package com.goings.kaidanzhushou.ui
 
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,16 +21,17 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.RotateRight
 import androidx.compose.material.icons.rounded.Check
-import androidx.compose.material.icons.rounded.RotateRight
 import androidx.compose.material3.Button
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.FilterChip
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -37,20 +42,26 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -78,22 +89,36 @@ fun ReviewScreen(viewModel: MainViewModel, batchId: String, recordId: String, ou
     val scope = rememberCoroutineScope()
     var invalidField by remember(activeRecordId) { mutableStateOf<String?>(null) }
     var focusAttempt by remember(activeRecordId) { mutableIntStateOf(0) }
+    val density = LocalDensity.current
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+
     LaunchedEffect(record?.id) {
         record?.let { if (initializedId != it.id) { fields = it.editable(); initializedId = it.id } }
     }
+
     fun switchRecord(offset: Int): Boolean {
         val nextIndex = index + offset
         if (index < 0 || nextIndex !in records.indices) return false
+        focusManager.clearFocus()
+        keyboardController?.hide()
         record?.let { viewModel.updateRecord(it.id, fields, changedFields(it, fields)) }
         activeRecordId = records[nextIndex].id
         return true
     }
-    androidx.compose.material3.Scaffold(
+
+    Scaffold(
         topBar = { AppTopBar(if (index >= 0) "核对 ${index + 1}/${records.size}" else "人工核对", onBack) },
         bottomBar = {
             Row(Modifier.fillMaxWidth().background(Color.White).padding(12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedButton(onClick = { record?.let { viewModel.updateRecord(it.id, fields, changedFields(it, fields)) } }, modifier = Modifier.weight(1f)) { Text("保存草稿") }
+                OutlinedButton(onClick = {
+                    focusManager.clearFocus()
+                    keyboardController?.hide()
+                    record?.let { viewModel.updateRecord(it.id, fields, changedFields(it, fields)) }
+                }, modifier = Modifier.weight(1f)) { Text("保存草稿") }
                 Button(onClick = {
+                    focusManager.clearFocus()
+                    keyboardController?.hide()
                     record?.let { current ->
                         val firstIssue = RecordValidator.validate(fields).firstOrNull()
                         if (firstIssue == null) {
@@ -113,8 +138,39 @@ fun ReviewScreen(viewModel: MainViewModel, batchId: String, recordId: String, ou
         },
     ) { padding ->
         record?.let { current ->
-            Column(Modifier.fillMaxSize().padding(padding)) {
-                LazyColumn(state = formState, modifier = Modifier.fillMaxWidth().weight(split), contentPadding = PaddingValues(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {
+                        focusManager.clearFocus()
+                        keyboardController?.hide()
+                    }
+                    .screenSwipeToSwitch(
+                        edgeMarginPx = with(density) { 32.dp.toPx() },
+                        dragThresholdPx = with(density) { 42.dp.toPx() },
+                        minFlingVelocityPx = with(density) { 320.dp.toPx() },
+                        minFlingDistancePx = with(density) { 15.dp.toPx() },
+                        onSwipeLeft = { switchRecord(1) },
+                        onSwipeRight = { switchRecord(-1) },
+                        onTapOutside = {
+                            focusManager.clearFocus()
+                            keyboardController?.hide()
+                        }
+                    )
+            ) {
+                LazyColumn(
+                    state = formState,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(split)
+                        .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {
+                            focusManager.clearFocus()
+                            keyboardController?.hide()
+                        },
+                    contentPadding = PaddingValues(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
                     item {
                         Field(
                             "到站 *", fields.destinationText.orEmpty(),
@@ -126,15 +182,30 @@ fun ReviewScreen(viewModel: MainViewModel, batchId: String, recordId: String, ou
                     item {
                         Text("配送方式 *", fontWeight = FontWeight.SemiBold, color = if (invalidField == "delivery_type") com.goings.kaidanzhushou.ui.theme.ErrorRed else Color.Unspecified)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            FilterChip(fields.deliveryType == "delivery", { fields = fields.copy(deliveryType = "delivery"); invalidField = null }, { Text("送货") })
-                            FilterChip(fields.deliveryType == "pickup", { fields = fields.copy(deliveryType = "pickup"); invalidField = null }, { Text("自提") })
+                            FilterChip(fields.deliveryType == "delivery", {
+                                focusManager.clearFocus()
+                                keyboardController?.hide()
+                                fields = fields.copy(deliveryType = "delivery")
+                                invalidField = null
+                            }, { Text("送货") })
+                            FilterChip(fields.deliveryType == "pickup", {
+                                focusManager.clearFocus()
+                                keyboardController?.hide()
+                                fields = fields.copy(deliveryType = "pickup")
+                                invalidField = null
+                            }, { Text("自提") })
                         }
                     }
                     item {
                         Text("付款方式 *", fontWeight = FontWeight.SemiBold, color = if (invalidField == "payment_type") com.goings.kaidanzhushou.ui.theme.ErrorRed else Color.Unspecified)
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             PaymentType.entries.forEach { payment ->
-                                FilterChip(fields.paymentType == payment.code, { fields = fields.copy(paymentType = payment.code); invalidField = null }, { Text(payment.label) })
+                                FilterChip(fields.paymentType == payment.code, {
+                                    focusManager.clearFocus()
+                                    keyboardController?.hide()
+                                    fields = fields.copy(paymentType = payment.code)
+                                    invalidField = null
+                                }, { Text(payment.label) })
                             }
                         }
                     }
@@ -155,16 +226,130 @@ fun ReviewScreen(viewModel: MainViewModel, batchId: String, recordId: String, ou
                     item { Field("运费", fields.freight?.plain().orEmpty(), { fields = fields.copy(freight = it.toDoubleOrNull()); if (invalidField == "freight") invalidField = null }, keyboard = KeyboardType.Decimal, isError = invalidField == "freight", selectRequest = if (invalidField == "freight") focusAttempt else 0) }
                 }
                 Box(Modifier.fillMaxWidth().height(18.dp).background(Color(0xFFE7EAF0)).pointerInput(Unit) {
-                    detectVerticalDragGestures { _, amount -> split = (split + amount / 1200f).coerceIn(.35f, .75f) }
+                    detectVerticalDragGestures { _, amount ->
+                        focusManager.clearFocus()
+                        keyboardController?.hide()
+                        split = (split + amount / 1200f).coerceIn(.35f, .75f)
+                    }
                 }) { Box(Modifier.align(Alignment.Center).fillMaxWidth(.18f).height(4.dp).clip(RoundedCornerShape(3.dp)).background(Color(0xFF9AA3B2))) }
-                Box(Modifier.fillMaxWidth().weight(1f - split)) {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .weight(1f - split)
+                        .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {
+                            focusManager.clearFocus()
+                            keyboardController?.hide()
+                        }
+                ) {
                     ZoomableImage(
                         file = File(current.originalPath),
+                        rotationDegrees = current.rotationDegrees,
+                        onRotate = {
+                            val nextDegrees = (current.rotationDegrees + 90) % 360
+                            viewModel.updateRotation(current.id, nextDegrees)
+                        },
                         position = if (index >= 0) "${index + 1}/${records.size}" else "",
-                        onSwipeLeft = { switchRecord(1) },
-                        onSwipeRight = { switchRecord(-1) },
                         modifier = Modifier.fillMaxSize(),
                     )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Screen-wide swipe gesture detector with VelocityTracker support.
+ * Supports both:
+ * 1) Short & fast flicks (flings) with high velocity and small travel distance
+ * 2) Continuous drag exceeding [dragThresholdPx]
+ * while protecting system edge navigation gestures.
+ */
+@Composable
+private fun Modifier.screenSwipeToSwitch(
+    edgeMarginPx: Float,
+    dragThresholdPx: Float,
+    minFlingVelocityPx: Float,
+    minFlingDistancePx: Float,
+    onSwipeLeft: () -> Boolean,
+    onSwipeRight: () -> Boolean,
+    onTapOutside: () -> Unit,
+): Modifier {
+    val currentOnSwipeLeft by rememberUpdatedState(onSwipeLeft)
+    val currentOnSwipeRight by rememberUpdatedState(onSwipeRight)
+    val currentOnTapOutside by rememberUpdatedState(onTapOutside)
+
+    return this.pointerInput(Unit) {
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+            val startX = down.position.x
+            val screenWidth = size.width
+
+            val isNearEdge = startX <= edgeMarginPx || startX >= (screenWidth - edgeMarginPx)
+            val velocityTracker = VelocityTracker()
+            velocityTracker.addPosition(down.uptimeMillis, down.position)
+
+            var totalDx = 0f
+            var totalDy = 0f
+            var isHorizontalSwipe: Boolean? = null
+            var switched = false
+            var moved = false
+
+            while (true) {
+                val event = awaitPointerEvent(PointerEventPass.Initial)
+                val pointer = event.changes.firstOrNull { it.id == down.id } ?: break
+
+                if (!pointer.pressed) {
+                    // Finger lifted up: evaluate fast fling / flick velocity!
+                    if (!switched && !isNearEdge) {
+                        val velocity = velocityTracker.calculateVelocity()
+                        val vx = velocity.x
+                        val vy = velocity.y
+                        val isFastFling = abs(vx) >= minFlingVelocityPx && abs(vx) > abs(vy) * 1.15f && abs(totalDx) >= minFlingDistancePx
+                        val isDistancePassed = abs(totalDx) >= dragThresholdPx && abs(totalDx) > abs(totalDy) * 1.15f
+
+                        if (isFastFling || isDistancePassed) {
+                            currentOnTapOutside()
+                            val toNext = if (isFastFling) vx < 0 else totalDx < 0
+                            switched = if (toNext) currentOnSwipeLeft() else currentOnSwipeRight()
+                            if (switched) pointer.consume()
+                        } else if (!moved) {
+                            currentOnTapOutside()
+                        }
+                    }
+                    break
+                }
+
+                velocityTracker.addPosition(pointer.uptimeMillis, pointer.position)
+                val dx = pointer.position.x - pointer.previousPosition.x
+                val dy = pointer.position.y - pointer.previousPosition.y
+                totalDx += dx
+                totalDy += dy
+
+                if (abs(totalDx) > 8f || abs(totalDy) > 8f) {
+                    moved = true
+                }
+
+                if (!isNearEdge && isHorizontalSwipe == null) {
+                    if (abs(totalDx) > 10f || abs(totalDy) > 10f) {
+                        if (abs(totalDx) > abs(totalDy) * 1.15f) {
+                            isHorizontalSwipe = true
+                        } else if (abs(totalDy) > abs(totalDx) * 1.15f) {
+                            isHorizontalSwipe = false
+                            break // Vertical scrolling in list
+                        }
+                    }
+                }
+
+                // If user dragged far enough while still holding finger down
+                if (isHorizontalSwipe == true && !switched && !isNearEdge) {
+                    if (abs(totalDx) >= dragThresholdPx && abs(totalDx) > abs(totalDy) * 1.15f) {
+                        currentOnTapOutside()
+                        switched = if (totalDx < 0) currentOnSwipeLeft() else currentOnSwipeRight()
+                        if (switched) {
+                            pointer.consume()
+                            break
+                        }
+                    }
                 }
             }
         }
@@ -193,7 +378,7 @@ private fun Field(
     selectRequest: Int = 0,
 ) {
     val focusRequester = remember { FocusRequester() }
-    var editor by remember { mutableStateOf(TextFieldValue(value, TextRange(value.length))) }
+    var editor by remember(value) { mutableStateOf(TextFieldValue(value, TextRange(value.length))) }
     LaunchedEffect(value) {
         if (value != editor.text) editor = TextFieldValue(value, TextRange(value.length))
     }
@@ -217,37 +402,31 @@ private fun Field(
 @Composable
 private fun ZoomableImage(
     file: File,
+    rotationDegrees: Int,
+    onRotate: () -> Unit,
     position: String,
-    onSwipeLeft: () -> Boolean,
-    onSwipeRight: () -> Boolean,
     modifier: Modifier,
 ) {
     var scale by remember(file) { mutableFloatStateOf(1f) }
     var x by remember(file) { mutableFloatStateOf(0f) }
     var y by remember(file) { mutableFloatStateOf(0f) }
-    var swipeDistance by remember(file) { mutableFloatStateOf(0f) }
-    var swipeLocked by remember(file) { mutableStateOf(false) }
-    var quarterTurns by remember(file) { mutableIntStateOf(0) }
-    val rotation by animateFloatAsState(targetValue = quarterTurns * 90f, label = "照片旋转")
-    Box(modifier.background(Color(0xFF161618)).clipToBounds().pointerInput(file) {
-        detectTransformGestures { _, pan, zoom, _ ->
-            val nextScale = (scale * zoom).coerceIn(1f, 5f)
-            if (scale <= 1.02f && nextScale <= 1.02f && zoom in .98f..1.02f) {
-                swipeDistance += pan.x
-                if (!swipeLocked && abs(swipeDistance) >= 110f) {
-                    val switched = if (swipeDistance < 0) onSwipeLeft() else onSwipeRight()
-                    if (switched) { swipeLocked = true; swipeDistance = 0f }
-                    else swipeDistance = swipeDistance.coerceIn(-109f, 109f)
+    val animatedRotation by animateFloatAsState(targetValue = rotationDegrees.toFloat(), label = "照片旋转")
+    Box(
+        modifier
+            .background(Color(0xFF161618))
+            .clipToBounds()
+            .pointerInput(file) {
+                detectTransformGestures { _, pan, zoom, _ ->
+                    val nextScale = (scale * zoom).coerceIn(1f, 5f)
+                    if (scale > 1.05f || nextScale > 1.05f) {
+                        scale = nextScale
+                        x += pan.x
+                        y += pan.y
+                        if (scale == 1f) { x = 0f; y = 0f }
+                    }
                 }
-            } else {
-                scale = nextScale
-                x += pan.x
-                y += pan.y
-                swipeDistance = 0f
-                if (scale == 1f) { x = 0f; y = 0f }
             }
-        }
-    }) {
+    ) {
         AsyncImage(
             model = file,
             contentDescription = "托运单照片",
@@ -257,21 +436,21 @@ private fun ZoomableImage(
                 scaleY = scale,
                 translationX = x,
                 translationY = y,
-                rotationZ = rotation,
+                rotationZ = animatedRotation,
             ),
         )
         IconButton(
             onClick = {
-                quarterTurns += 1
                 scale = 1f
                 x = 0f
                 y = 0f
+                onRotate()
             },
             modifier = Modifier.align(Alignment.TopEnd).padding(10.dp).clip(RoundedCornerShape(22.dp)).background(Color.Black.copy(alpha = .62f)),
         ) {
-            Icon(Icons.Rounded.RotateRight, contentDescription = "顺时针旋转照片", tint = Color.White)
+            Icon(Icons.AutoMirrored.Rounded.RotateRight, contentDescription = "顺时针旋转照片", tint = Color.White)
         }
-        Text("左右滑动切换  $position", color = Color.White, style = androidx.compose.material3.MaterialTheme.typography.labelSmall, modifier = Modifier.align(Alignment.BottomCenter).background(Color.Black.copy(.62f), RoundedCornerShape(topStart = 10.dp, topEnd = 10.dp)).padding(horizontal = 14.dp, vertical = 7.dp))
+        Text("左右滑动切换  $position", color = Color.White, style = MaterialTheme.typography.labelSmall, modifier = Modifier.align(Alignment.BottomCenter).background(Color.Black.copy(.62f), RoundedCornerShape(topStart = 10.dp, topEnd = 10.dp)).padding(horizontal = 14.dp, vertical = 7.dp))
     }
 }
 

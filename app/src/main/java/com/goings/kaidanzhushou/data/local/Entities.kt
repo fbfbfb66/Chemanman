@@ -61,6 +61,7 @@ data class RecordEntity(
     val notes: String? = null,
     val errorMessage: String? = null,
     val attemptCount: Int = 0,
+    val rotationDegrees: Int = 0,
     val updatedAt: Long = capturedAt,
 ) {
     fun editable() = EditableFields(

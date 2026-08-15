@@ -3,12 +3,17 @@ package com.goings.kaidanzhushou.ui
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -33,19 +38,23 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.CameraAlt
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.FileUpload
 import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
-import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -55,8 +64,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.blur
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
@@ -71,7 +82,6 @@ import com.goings.kaidanzhushou.ui.screens.AppTopBar
 import com.goings.kaidanzhushou.ui.theme.AppBackground
 import com.goings.kaidanzhushou.ui.theme.ErrorRed
 import com.goings.kaidanzhushou.ui.theme.PrimaryBlue
-import com.goings.kaidanzhushou.ui.theme.Secondary
 import com.goings.kaidanzhushou.ui.theme.Success
 import com.goings.kaidanzhushou.ui.theme.Warning
 import java.io.File
@@ -104,48 +114,87 @@ fun BatchScreen(
             RecordFilter.FAILED -> it.recognitionStatus == RecognitionStatus.FAILED
         }
     }
-    androidx.compose.material3.Scaffold(
+    Scaffold(
         containerColor = AppBackground,
         topBar = {
-            AppTopBar(if (selecting) "已选 ${selected.size}" else batch?.name.orEmpty(), onBack = if (selecting) ({ selecting = false; selected = emptySet() }) else onBack) {
-                TextButton(onClick = { selecting = !selecting; selected = emptySet() }) { Text(if (selecting) "完成" else "选择") }
+            AppTopBar(
+                title = if (selecting) "已选 ${selected.size}" else batch?.name.orEmpty(),
+                onBack = if (selecting) ({ selecting = false; selected = emptySet() }) else onBack
+            ) {
+                if (selecting) {
+                    TextButton(onClick = { selecting = false; selected = emptySet() }) {
+                        Text("完成", fontWeight = FontWeight.Bold, color = PrimaryBlue)
+                    }
+                } else {
+                    IconButton(
+                        onClick = { selecting = true; selected = emptySet() },
+                        enabled = records.isNotEmpty()
+                    ) {
+                        Icon(Icons.Rounded.DeleteOutline, contentDescription = "选择照片并删除")
+                    }
+                }
             }
         },
         bottomBar = {
-            if (selecting) Row(Modifier.fillMaxWidth().background(Color.White).padding(14.dp), horizontalArrangement = Arrangement.Center) {
-                Button(onClick = { confirmDelete = true }, enabled = selected.isNotEmpty()) { Icon(Icons.Rounded.Delete, null); Text("删除 ${selected.size} 张") }
-            } else Column(Modifier.background(Color.White).padding(14.dp)) {
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedButton(onClick = onCamera, enabled = records.size < 100, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.CameraAlt, null); Text("连续拍照") }
-                    OutlinedButton(onClick = { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }, enabled = records.size < 100, modifier = Modifier.weight(1f)) { Icon(Icons.Rounded.Image, null); Text("相册导入") }
+            if (selecting) {
+                Row(Modifier.fillMaxWidth().background(Color.White).padding(14.dp), horizontalArrangement = Arrangement.Center) {
+                    Button(
+                        onClick = { confirmDelete = true },
+                        enabled = selected.isNotEmpty(),
+                        colors = ButtonDefaults.buttonColors(containerColor = ErrorRed),
+                    ) {
+                        Icon(Icons.Rounded.Delete, null)
+                        Spacer(Modifier.size(6.dp))
+                        Text("删除 ${selected.size} 张")
+                    }
                 }
-                Button(
-                    onClick = {
-                        if (recognizing && !paused) viewModel.pauseRecognition(batchId)
-                        else viewModel.startRecognition(batchId, retryFailed = true)
-                    },
-                    enabled = recognizing || canStartRecognition,
-                    modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
-                ) {
-                    Icon(if (recognizing && !paused) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, null)
-                    Text(
-                        when {
-                            recognizing && !paused -> "AI 识别中  $completedCount/${records.size}"
-                            recognizing && paused -> "继续 AI 识别"
-                            records.any { it.recognitionStatus == RecognitionStatus.FAILED } && records.none { it.recognitionStatus == RecognitionStatus.UNRECOGNIZED } -> "重试失败照片"
-                            else -> "开始 AI 识别"
+            } else {
+                Column(Modifier.background(Color.White).padding(14.dp)) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        OutlinedButton(onClick = onCamera, enabled = records.size < 100, modifier = Modifier.weight(1f)) {
+                            Icon(Icons.Rounded.CameraAlt, null)
+                            Spacer(Modifier.size(6.dp))
+                            Text("连续拍照")
+                        }
+                        OutlinedButton(onClick = { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }, enabled = records.size < 100, modifier = Modifier.weight(1f)) {
+                            Icon(Icons.Rounded.Image, null)
+                            Spacer(Modifier.size(6.dp))
+                            Text("相册导入")
+                        }
+                    }
+                    Button(
+                        onClick = {
+                            if (recognizing && !paused) viewModel.pauseRecognition(batchId)
+                            else viewModel.startRecognition(batchId, retryFailed = true)
                         },
-                    )
-                }
-                if (recognizing) {
-                    LinearProgressIndicator(
-                        progress = { if (records.isEmpty()) 0f else completedCount.toFloat() / records.size },
+                        enabled = recognizing || canStartRecognition,
+                        modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                    ) {
+                        Icon(if (recognizing && !paused) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, null)
+                        Spacer(Modifier.size(6.dp))
+                        Text(
+                            when {
+                                recognizing && !paused -> "AI 识别中  $completedCount/${records.size}"
+                                recognizing && paused -> "继续 AI 识别"
+                                records.any { it.recognitionStatus == RecognitionStatus.FAILED } && records.none { it.recognitionStatus == RecognitionStatus.UNRECOGNIZED } -> "重试失败照片"
+                                else -> "开始 AI 识别"
+                            },
+                        )
+                    }
+                    if (recognizing) {
+                        AiRecognitionProgressBar(
+                            completedCount = completedCount,
+                            totalCount = records.size,
+                            isPaused = paused,
+                            modifier = Modifier.padding(top = 10.dp, bottom = 2.dp)
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = onExport,
                         modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                    )
-                }
-                Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.Center) {
-                    OutlinedButton(onClick = onExport, modifier = Modifier.fillMaxWidth(.62f)) {
+                    ) {
                         Icon(Icons.Rounded.FileUpload, null)
+                        Spacer(Modifier.size(6.dp))
                         Text("检查并导出")
                     }
                 }
@@ -202,54 +251,286 @@ fun PhotoTile(record: RecordEntity, selecting: Boolean = false, selected: Boolea
         record.reviewStatus == ReviewStatus.NEEDS_REVIEW -> Warning
         else -> Color(0xFF9AA3B2)
     }
-    Box(Modifier.aspectRatio(.78f).clip(RoundedCornerShape(14.dp)).background(Color(0xFFE5E5EA)).clickable(onClick = onClick)) {
+    Box(
+        Modifier
+            .aspectRatio(.78f)
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color(0xFFE5E5EA))
+            .clickable(onClick = onClick)
+    ) {
         RecognitionThumbnail(record, isProcessing, isWaiting)
-        Box(Modifier.align(Alignment.TopEnd).padding(7.dp).size(12.dp).clip(CircleShape).background(statusColor))
-        Text(record.sourceLabel, color = Color.White, style = MaterialTheme.typography.labelSmall, modifier = Modifier.align(Alignment.BottomStart).fillMaxWidth().background(Color.Black.copy(alpha = .58f)).padding(7.dp))
-        if (record.blurWarning || record.darknessWarning) Text("画质警告", color = Color.White, style = MaterialTheme.typography.labelSmall, modifier = Modifier.align(Alignment.TopStart).background(Warning).padding(horizontal = 5.dp, vertical = 2.dp))
-        if (selecting) Box(Modifier.fillMaxSize().background(if (selected) PrimaryBlue.copy(alpha = .24f) else Color.Black.copy(alpha = .12f))) {
-            Icon(Icons.Rounded.CheckCircle, null, tint = if (selected) PrimaryBlue else Color.White, modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp))
+        Box(
+            Modifier
+                .align(Alignment.TopEnd)
+                .padding(7.dp)
+                .size(10.dp)
+                .clip(CircleShape)
+                .background(statusColor)
+        )
+        Text(
+            record.sourceLabel,
+            color = Color.White,
+            style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .fillMaxWidth()
+                .background(Color.Black.copy(alpha = .58f))
+                .padding(horizontal = 7.dp, vertical = 5.dp)
+        )
+        if (record.blurWarning || record.darknessWarning) {
+            Text(
+                "画质警告",
+                color = Color.White,
+                style = MaterialTheme.typography.labelSmall,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .background(Warning)
+                    .padding(horizontal = 5.dp, vertical = 2.dp)
+            )
+        }
+        if (selecting) {
+            Box(Modifier.fillMaxSize().background(if (selected) PrimaryBlue.copy(alpha = .24f) else Color.Black.copy(alpha = .12f))) {
+                Icon(
+                    Icons.Rounded.CheckCircle,
+                    contentDescription = null,
+                    tint = if (selected) PrimaryBlue else Color.White,
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp)
+                )
+            }
         }
     }
 }
 
 @Composable
 private fun RecognitionThumbnail(record: RecordEntity, isProcessing: Boolean, isWaiting: Boolean) {
-    if (!isProcessing) {
+    Box(Modifier.fillMaxSize()) {
         AsyncImage(
             model = File(record.thumbnailPath ?: record.originalPath),
             contentDescription = record.sourceLabel,
             contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier
+                .fillMaxSize()
+                .then(if (record.rotationDegrees != 0) Modifier.graphicsLayer(rotationZ = record.rotationDegrees.toFloat()) else Modifier)
+                .then(if (isProcessing) Modifier.blur(16.dp) else Modifier),
         )
-        if (isWaiting) Box(Modifier.fillMaxSize().background(PrimaryBlue.copy(alpha = .10f)))
-        return
-    }
 
-    val transition = rememberInfiniteTransition(label = "AI 识别呼吸")
-    val blurRadius by transition.animateFloat(
-        initialValue = 1.5f,
-        targetValue = 7f,
-        animationSpec = infiniteRepeatable(animation = tween(1_050), repeatMode = RepeatMode.Reverse),
-        label = "模糊",
+        if (isProcessing) {
+            val transition = rememberInfiniteTransition(label = "FrostedGlassShimmer")
+            val shimmerProgress by transition.animateFloat(
+                initialValue = -1f,
+                targetValue = 2f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(2200, easing = LinearEasing),
+                    repeatMode = RepeatMode.Restart
+                ),
+                label = "shimmer"
+            )
+
+            // Frosted glass overlay: semi-transparent frost tint with specular edge border
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            listOf(
+                                Color.White.copy(alpha = 0.32f),
+                                Color(0xFFEBF2FF).copy(alpha = 0.18f),
+                                Color.White.copy(alpha = 0.28f)
+                            )
+                        )
+                    )
+                    .border(
+                        1.dp,
+                        Brush.linearGradient(
+                            listOf(
+                                Color.White.copy(alpha = 0.7f),
+                                Color.White.copy(alpha = 0.2f),
+                                Color.White.copy(alpha = 0.5f)
+                            )
+                        ),
+                        RoundedCornerShape(14.dp)
+                    )
+            )
+
+            // Dynamic diagonal glass reflection shimmer sweep
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val width = size.width
+                val height = size.height
+                val startX = width * shimmerProgress
+                val brush = Brush.linearGradient(
+                    colors = listOf(
+                        Color.Transparent,
+                        Color.White.copy(alpha = 0.40f),
+                        Color.White.copy(alpha = 0.15f),
+                        Color.Transparent
+                    ),
+                    start = Offset(startX, 0f),
+                    end = Offset(startX + width * 0.75f, height)
+                )
+                drawRect(brush = brush)
+            }
+
+            // Center Frosted Glass AI badge (VisionOS / Liquid Glass capsule)
+            Row(
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(Color(0x99182230))
+                    .border(0.5.dp, Color.White.copy(alpha = 0.35f), RoundedCornerShape(20.dp))
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(12.dp),
+                    strokeWidth = 1.8.dp,
+                    color = Color.White,
+                    trackColor = Color.White.copy(alpha = 0.2f)
+                )
+                Text(
+                    "识别中",
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+        } else if (isWaiting) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.18f))
+            ) {
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Color(0x80222B3A))
+                        .border(0.5.dp, Color.White.copy(alpha = 0.25f), RoundedCornerShape(16.dp))
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        "排队中",
+                        color = Color.White.copy(alpha = 0.92f),
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun AiRecognitionProgressBar(
+    completedCount: Int,
+    totalCount: Int,
+    isPaused: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val targetProgress = if (totalCount <= 0) 0f else (completedCount.toFloat() / totalCount).coerceIn(0f, 1f)
+    val animatedProgress by animateFloatAsState(
+        targetValue = targetProgress,
+        animationSpec = tween(durationMillis = 500, easing = FastOutSlowInEasing),
+        label = "smoothProgress"
     )
-    val scale by transition.animateFloat(
-        initialValue = 1.01f,
-        targetValue = 1.07f,
-        animationSpec = infiniteRepeatable(animation = tween(1_050), repeatMode = RepeatMode.Reverse),
-        label = "缩放",
+
+    val shimmerTransition = rememberInfiniteTransition(label = "ProgressShimmer")
+    val shimmerPhase by shimmerTransition.animateFloat(
+        initialValue = -0.6f,
+        targetValue = 1.6f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1600, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "progressShimmer"
     )
-    val glow by transition.animateFloat(
-        initialValue = .08f,
-        targetValue = .28f,
-        animationSpec = infiniteRepeatable(animation = tween(1_050), repeatMode = RepeatMode.Reverse),
-        label = "蓝光",
+    val pulseAlpha by shimmerTransition.animateFloat(
+        initialValue = 0.4f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(800, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "pulseAlpha"
     )
-    AsyncImage(
-        model = File(record.thumbnailPath ?: record.originalPath),
-        contentDescription = record.sourceLabel,
-        contentScale = ContentScale.Crop,
-        modifier = Modifier.fillMaxSize().graphicsLayer(scaleX = scale, scaleY = scale).blur(blurRadius.dp),
-    )
-    Box(Modifier.fillMaxSize().background(PrimaryBlue.copy(alpha = glow)))
+
+    Column(modifier = modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(7.dp)
+                        .clip(CircleShape)
+                        .background(if (isPaused) Warning else PrimaryBlue.copy(alpha = pulseAlpha))
+                )
+                Text(
+                    text = if (isPaused) "AI 识别已暂停 ($completedCount/$totalCount)"
+                    else "AI 正在识别 · 已完成 $completedCount/$totalCount",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (isPaused) Warning else PrimaryBlue,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            Text(
+                text = "${(animatedProgress * 100).toInt()}%",
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold,
+                color = PrimaryBlue
+            )
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(8.dp)
+                .clip(CircleShape)
+                .background(Color(0xFFE2EAF8))
+        ) {
+            if (animatedProgress > 0.001f) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(animatedProgress)
+                        .height(8.dp)
+                        .clip(CircleShape)
+                        .background(
+                            Brush.horizontalGradient(
+                                listOf(
+                                    Color(0xFF4C93FF),
+                                    PrimaryBlue,
+                                    Color(0xFF1351D8)
+                                )
+                            )
+                        )
+                ) {
+                    if (!isPaused) {
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            val w = size.width
+                            val h = size.height
+                            val lightX = w * shimmerPhase
+                            drawRect(
+                                brush = Brush.horizontalGradient(
+                                    colors = listOf(
+                                        Color.Transparent,
+                                        Color.White.copy(alpha = 0.65f),
+                                        Color.Transparent
+                                    ),
+                                    startX = lightX,
+                                    endX = lightX + w * 0.45f
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

@@ -134,6 +134,10 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
         return issues.map { it.message }
     }
 
+    suspend fun updateRotation(recordId: String, rotationDegrees: Int) = withContext(Dispatchers.IO) {
+        dao.updateRotation(recordId, rotationDegrees)
+    }
+
     suspend fun applyDraft(recordId: String, draft: RecognitionDraft) {
         db.withTransaction {
             val old = dao.getRecord(recordId) ?: return@withTransaction

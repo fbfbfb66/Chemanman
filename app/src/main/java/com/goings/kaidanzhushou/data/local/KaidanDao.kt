@@ -65,6 +65,9 @@ interface KaidanDao {
 
     @Update suspend fun updateRecord(record: RecordEntity)
 
+    @Query("UPDATE records SET rotationDegrees = :rotationDegrees WHERE id = :id")
+    suspend fun updateRotation(id: String, rotationDegrees: Int)
+
     @Query("DELETE FROM records WHERE id = :id")
     suspend fun deleteRecordById(id: String)
 
