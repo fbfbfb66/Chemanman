@@ -32,11 +32,12 @@ class XlsxExporter {
             val row = index + 2
             append("<row r=\"$row\">")
             val values = listOf(
-                Cell.Text("v1.1"), Cell.Text(batch.id), Cell.Text(record.id), Cell.Text(record.sourceLabel),
+                Cell.Text(SCHEMA_VERSION), Cell.Text(batch.id), Cell.Text(record.id), Cell.Text(record.sourceLabel),
                 Cell.Text(record.destinationText), Cell.Text(record.deliveryType), Cell.Text(record.senderName),
                 Cell.Text(record.receiverName), Cell.Text(record.receiverMobile), Cell.Text(record.goodsName),
                 Cell.Text(record.packageName), Cell.Number(record.quantity), Cell.Number(record.weight),
                 Cell.Number(record.volume), Cell.Number(record.freight), Cell.Text(record.paymentType),
+                Cell.Text(record.destinationUniqueKey), Cell.Text(record.destinationDisplay),
             )
             values.forEachIndexed { column, value ->
                 when (value) {
@@ -46,13 +47,22 @@ class XlsxExporter {
             }
             append("</row>")
         }
-        append("</sheetData><autoFilter ref=\"A1:P${records.size + 1}\"/>")
+        append("</sheetData><autoFilter ref=\"A1:${ref(COLUMNS.lastIndex, records.size + 1)}\"/>")
         append("</worksheet>")
     }
 
     private fun textCell(ref: String, value: String) = "<c r=\"$ref\" t=\"inlineStr\"><is><t xml:space=\"preserve\">${xml(value)}</t></is></c>"
     private fun numberCell(ref: String, value: String) = "<c r=\"$ref\" t=\"n\"><v>$value</v></c>"
-    private fun ref(column: Int, row: Int) = "${('A'.code + column).toChar()}$row"
+    internal fun ref(column: Int, row: Int): String {
+        // 双射 26 进制（A..Z, AA..AZ, ...），支持超过 26 列。
+        var remaining = column
+        var letters = ""
+        while (remaining >= 0) {
+            letters = ('A'.code + remaining % 26).toChar() + letters
+            remaining = remaining / 26 - 1
+        }
+        return "$letters$row"
+    }
     private fun xml(value: String) = value.filter { it == '\t' || it == '\n' || it == '\r' || it.code >= 0x20 }
         .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
 
@@ -74,10 +84,11 @@ class XlsxExporter {
     }
 
     companion object {
+        const val SCHEMA_VERSION = "v1.2"
         val COLUMNS = listOf(
             "schema_version", "batch_id", "source_record_id", "source_label", "destination_text", "delivery_type",
             "sender_name", "receiver_name", "receiver_mobile", "goods_name", "package", "quantity", "weight",
-            "volume", "freight", "payment_type",
+            "volume", "freight", "payment_type", "destination_unique_key", "destination_display",
         )
     }
 }

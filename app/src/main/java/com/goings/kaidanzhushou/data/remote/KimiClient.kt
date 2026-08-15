@@ -1,6 +1,7 @@
 package com.goings.kaidanzhushou.data.remote
 
 import com.goings.kaidanzhushou.BuildConfig
+import com.goings.kaidanzhushou.domain.DestinationDictionary
 import com.goings.kaidanzhushou.domain.RecognitionDraft
 import com.goings.kaidanzhushou.domain.PaymentType
 import kotlinx.coroutines.CancellationException
@@ -51,6 +52,8 @@ class KimiClient(
     private val requestTimeoutMillis: Long = 40_000,
     private val hedgeAfterMillis: Long = 12_000,
     maxConcurrentHedges: Int = 2,
+    // 每次识别时取一次快照；destination_canonical 的 enum 从这里注入。空字典时 enum 只有 null，诚实降级。
+    private val dictionary: () -> DestinationDictionary = { DestinationDictionary.EMPTY },
 ) {
     private val hedgePermits = Semaphore(maxConcurrentHedges)
 
@@ -60,10 +63,12 @@ class KimiClient(
      * 整个过程封在客户端内部：不改状态机、不加 attemptCount、不写 RETRY_WAIT，上层与用户无感。
      */
     suspend fun recognize(apiKey: String, image: File): RecognitionDraft = withContext(Dispatchers.IO) {
-        val request = request(apiKey, image)
+        // 快照一次，保证对冲的两发请求用同一份字典。
+        val dict = dictionary()
+        val request = request(apiKey, image, dict)
         coroutineScope {
             val streaming = CompletableDeferred<Unit>()
-            val primary = async { attempt(request) { streaming.complete(Unit) } }
+            val primary = async { attempt(request, dict) { streaming.complete(Unit) } }
             // 首字节到达或请求已结束都说明无需对冲；只有静默超过窗口才补发。
             val stalled = withTimeoutOrNull(hedgeAfterMillis) {
                 select {
@@ -74,7 +79,7 @@ class KimiClient(
             // 名额耗尽时老实等原请求，避免大面积卡顿下在途请求翻倍。
             if (!stalled || !hedgePermits.tryAcquire()) return@coroutineScope primary.await().getOrThrow()
             try {
-                val hedge = async { attempt(request) {} }
+                val hedge = async { attempt(request, dict) {} }
                 val (settled, other) = select<Pair<Result<RecognitionDraft>, Deferred<Result<RecognitionDraft>>>> {
                     primary.onAwait { it to hedge }
                     hedge.onAwait { it to primary }
@@ -87,15 +92,15 @@ class KimiClient(
         }
     }
 
-    private suspend fun attempt(request: Request, onStreamStart: () -> Unit): Result<RecognitionDraft> = try {
-        Result.success(execute(request, onStreamStart))
+    private suspend fun attempt(request: Request, dict: DestinationDictionary, onStreamStart: () -> Unit): Result<RecognitionDraft> = try {
+        Result.success(execute(request, dict, onStreamStart))
     } catch (cancellation: CancellationException) {
         throw cancellation
     } catch (error: KimiException) {
         Result.failure(error)
     }
 
-    private suspend fun execute(request: Request, onStreamStart: () -> Unit): RecognitionDraft {
+    private suspend fun execute(request: Request, dict: DestinationDictionary, onStreamStart: () -> Unit): RecognitionDraft {
         val call = http.newCall(request)
         call.timeout().timeout(requestTimeoutMillis, TimeUnit.MILLISECONDS)
         // 落败方被取消时立刻断开 socket，不让它继续占用上行带宽。
@@ -123,7 +128,7 @@ class KimiClient(
                 }
                 val body = response.body ?: throw KimiException(KimiErrorKind.INVALID_RESPONSE, "Kimi 返回空响应")
                 val content = SseContentParser(json).parse(body.source(), onStreamStart)
-                return parseDraft(content)
+                return parseDraft(content, dict)
             }
         } catch (error: KimiException) {
             throw error
@@ -136,25 +141,30 @@ class KimiClient(
         }
     }
 
-    private fun request(apiKey: String, image: File): Request = Request.Builder()
+    private fun request(apiKey: String, image: File, dict: DestinationDictionary): Request = Request.Builder()
         .url("${baseUrl}chat/completions")
         .header("Authorization", "Bearer $apiKey")
         .header("Accept", "text/event-stream")
-        .post(requestBody(image).toString().toRequestBody(JSON_MEDIA))
+        .post(requestBody(image, dict).toString().toRequestBody(JSON_MEDIA))
         .build()
 
-    internal fun parseDraft(content: String): RecognitionDraft = try {
+    internal fun parseDraft(content: String, dict: DestinationDictionary = dictionary()): RecognitionDraft = try {
         val objectValue = json.parseToJsonElement(content).jsonObject
         if (!REQUIRED_FIELDS.all(objectValue::containsKey)) {
             throw KimiException(KimiErrorKind.INVALID_RESPONSE, "AI 返回字段不完整")
         }
-        json.decodeFromString<RecognitionDraft>(content).also { draft ->
+        json.decodeFromString<RecognitionDraft>(content).let { draft ->
             if (draft.delivery_type != null && draft.delivery_type !in setOf("delivery", "pickup")) {
                 throw KimiException(KimiErrorKind.INVALID_RESPONSE, "AI 返回配送方式无效")
             }
             if (draft.payment_type != null && draft.payment_type !in PaymentType.codes) {
                 throw KimiException(KimiErrorKind.INVALID_RESPONSE, "AI 返回付款方式无效")
             }
+            // canonical 不在字典 → 降级为 null 而不是抛异常：字典是用户可更新的，可能与请求时的版本漂移，
+            // 抛 INVALID_RESPONSE 会触发无意义的整轮重试（异于 payment_type 这种我们自有的闭集）。
+            if (draft.destination_canonical != null && draft.destination_canonical !in dict.enumNames) {
+                draft.copy(destination_canonical = null)
+            } else draft
         }
     } catch (error: KimiException) {
         throw error
@@ -162,7 +172,7 @@ class KimiClient(
         throw KimiException(KimiErrorKind.INVALID_RESPONSE, "AI 返回内容不符合数据格式")
     }
 
-    private fun requestBody(image: File): JsonObject {
+    private fun requestBody(image: File, dict: DestinationDictionary): JsonObject {
         val encoded = Base64.getEncoder().encodeToString(image.readBytes())
         return buildJsonObject {
             put("model", JsonPrimitive(MODEL))
@@ -178,7 +188,7 @@ class KimiClient(
                         })
                         add(buildJsonObject {
                             put("type", JsonPrimitive("text"))
-                            put("text", JsonPrimitive(PROMPT))
+                            put("text", JsonPrimitive(prompt(dict)))
                         })
                     })
                 })
@@ -186,23 +196,37 @@ class KimiClient(
             put("response_format", buildJsonObject {
                 put("type", JsonPrimitive("json_schema"))
                 put("json_schema", buildJsonObject {
-                    put("name", JsonPrimitive("waybill_record_v1_1"))
+                    put("name", JsonPrimitive("waybill_record_v1_2"))
                     put("strict", JsonPrimitive(true))
-                    put("schema", schema())
+                    put("schema", schema(dict))
                 })
             })
         }
     }
 
-    private fun schema(): JsonObject {
+    private fun schema(dict: DestinationDictionary): JsonObject {
         fun nullable(type: String) = JsonArray(listOf(JsonPrimitive(type), JsonPrimitive("null")))
+        fun nullableEnum(values: List<String>) = buildJsonObject {
+            put("type", nullable("string"))
+            put("enum", JsonArray(values.map(::JsonPrimitive) + JsonNull))
+        }
         return buildJsonObject {
             put("type", JsonPrimitive("object"))
             put("additionalProperties", JsonPrimitive(false))
             put("properties", buildJsonObject {
-                listOf("destination_text", "sender_name", "receiver_name", "receiver_mobile", "goods_name", "package").forEach {
+                listOf("sender_name", "receiver_name", "receiver_mobile", "goods_name", "package").forEach {
                     put(it, buildJsonObject { put("type", nullable("string")) })
                 }
+                put("destination_raw_tokens", buildJsonObject {
+                    put("type", JsonPrimitive("array"))
+                    put("items", buildJsonObject { put("type", JsonPrimitive("string")) })
+                    put("maxItems", JsonPrimitive(8))
+                })
+                put("destination_checked_token", buildJsonObject { put("type", nullable("string")) })
+                put("destination_mark_type", nullableEnum(listOf("check", "circle", "underline")))
+                put("destination_layout", nullableEnum(listOf("checklist", "handwritten")))
+                // enum 硬约束：模型在解码层面就不可能输出「玉溪通海」这类字典外的词。
+                put("destination_canonical", nullableEnum(dict.enumNames))
                 put("delivery_type", buildJsonObject {
                     put("type", nullable("string"))
                     put("enum", JsonArray(listOf(JsonPrimitive("delivery"), JsonPrimitive("pickup"), JsonNull)))
@@ -216,10 +240,22 @@ class KimiClient(
                     put(it, buildJsonObject { put("type", nullable("number")); put("minimum", JsonPrimitive(0)) })
                 }
             })
-            put("required", JsonArray(listOf(
-                "destination_text", "delivery_type", "sender_name", "receiver_name", "receiver_mobile",
-                "goods_name", "package", "quantity", "weight", "volume", "freight", "payment_type",
-            ).map(::JsonPrimitive)))
+            put("required", JsonArray(REQUIRED_FIELDS.map(::JsonPrimitive)))
+        }
+    }
+
+    private fun prompt(dict: DestinationDictionary): String {
+        val stationList = dict.enumNames.joinToString("\n") { name ->
+            val station = dict.stations.firstOrNull { it.name == name && !it.excluded }
+            val prefix = station?.full_name?.removeSuffix(name).orEmpty()
+            if (prefix.isBlank()) name else "$name（$prefix）"
+        }
+        return buildString {
+            append(PROMPT_BASE)
+            if (stationList.isNotBlank()) {
+                append("\n可选的标准到站列表（destination_canonical 只能从中选择）：\n")
+                append(stationList)
+            }
         }
     }
 
@@ -227,9 +263,12 @@ class KimiClient(
         val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
         const val MODEL = "kimi-k2.6"
         val REQUIRED_FIELDS = setOf(
-            "destination_text", "delivery_type", "sender_name", "receiver_name", "receiver_mobile",
+            "destination_raw_tokens", "destination_checked_token", "destination_mark_type",
+            "destination_layout", "destination_canonical",
+            "delivery_type", "sender_name", "receiver_name", "receiver_mobile",
             "goods_name", "package", "quantity", "weight", "volume", "freight", "payment_type",
         )
-        const val PROMPT = """你是托运单录入助手。只提取图片中明确可见的信息，禁止推测、补全或编造。无法确认的字段必须返回 null。delivery_type 只能是 delivery（送货）或 pickup（自提）。付款方式严格映射：单据写“现付”返回 payment_type=pay_billing；写“提付”或“到付”返回 pay_arrival；写“回付”返回 pay_receipt；看不清则返回 null。quantity 为件数；weight、volume、freight 仅返回数字。发货地点永远是昆明，到站不可能是昆明，禁止将昆明填入 destination_text。若单据上显示两个到站，以被打勾标注的到站为准。单据中的“收货方”就是收货人，填入 receiver_name。"""
+        const val PROMPT_BASE = """你是托运单录入助手。只提取图片中明确可见的信息，禁止推测、补全或编造。无法确认的字段必须返回 null。delivery_type 只能是 delivery（送货）或 pickup（自提）。付款方式严格映射：单据写“现付”返回 payment_type=pay_billing；写“提付”或“到付”返回 pay_arrival；写“回付”返回 pay_receipt；看不清则返回 null。quantity 为件数；weight、volume、freight 仅返回数字。单据中的“收货方”就是收货人，填入 receiver_name。
+到站字段只做“读图取证”，不要下结论：destination_raw_tokens 逐项照抄单据上出现的到站文字，一个格子或一个词一项，严禁把相邻的两个地名拼成一个词，严禁补上单据里没有的“市”“县”等字。若某一项带勾、圆圈或下划线标记，把该项原文放进 destination_checked_token，并在 destination_mark_type 填 check/circle/underline；没有任何标记就都返回 null。版面是印刷好的勾选表时 destination_layout 填 checklist，是手写的填 handwritten，看不清填 null。destination_canonical 只在你有十足把握判断标准到站时从列表中选择，拿不准一律返回 null。发货地点永远是昆明，到站不可能是昆明。"""
     }
 }

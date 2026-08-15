@@ -6,6 +6,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.goings.kaidanzhushou.AppContainer
 import com.goings.kaidanzhushou.domain.EditableFields
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
@@ -14,8 +15,16 @@ import com.goings.kaidanzhushou.data.local.ExportEntity
 
 class MainViewModel(private val container: AppContainer) : ViewModel() {
     val batches = container.repository.observeBatches()
+    val receiverProfiles = container.repository.observeReceiverProfiles()
+    val goodsProfiles = container.repository.observeGoodsProfiles()
     private val _events = MutableSharedFlow<UiNotice>(extraBufferCapacity = 4)
     val events = _events.asSharedFlow()
+
+    init {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { container.repository.seedProfilesFromConfirmedRecords() }.onFailure(::error)
+        }
+    }
 
     fun batch(id: String) = container.repository.observeBatch(id)
     fun records(batchId: String) = container.repository.observeRecords(batchId)
@@ -74,8 +83,11 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     fun pauseRecognition(batchId: String) = viewModelScope.launch { container.recognitionManager.pause(batchId) }
 
     fun updateRecord(id: String, fields: EditableFields, changed: Set<String>) = viewModelScope.launch {
-        runCatching { container.repository.updateFields(id, fields, changed) }.onFailure(::error)
+        runCatching { container.repository.updateFields(id, fields, changed, displayFor(fields)) }.onFailure(::error)
     }
+
+    private fun displayFor(fields: EditableFields): String? =
+        fields.destinationUniqueKey?.let { container.dictionaryStore.current().byKey[it]?.full_name }
 
     fun updateRotation(id: String, rotationDegrees: Int) = viewModelScope.launch {
         runCatching { container.repository.updateRotation(id, rotationDegrees) }.onFailure(::error)
@@ -88,8 +100,7 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
 
     fun saveAndConfirm(id: String, fields: EditableFields, changed: Set<String>, done: () -> Unit) = viewModelScope.launch {
         runCatching {
-            container.repository.updateFields(id, fields, changed)
-            container.repository.confirm(id)
+            container.repository.saveAndConfirm(id, fields, changed, displayFor(fields))
         }.onSuccess { issues ->
             if (issues.isEmpty()) { _events.emit(UiNotice.success("已确认")); done() } else _events.emit(UiNotice.warning(issues.joinToString("；")))
         }.onFailure(::error)
@@ -107,6 +118,8 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     fun clearApiKey() { container.apiKeyStore.clear(); _events.tryEmit(UiNotice.success("API Key 已清除")) }
+
+    fun destinationDictionary() = container.dictionaryStore.current()
 
     fun showWarning(message: String) { _events.tryEmit(UiNotice.warning(message)) }
 

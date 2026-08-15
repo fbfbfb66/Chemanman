@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -25,12 +26,18 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.RotateRight
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -50,6 +57,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
@@ -59,7 +67,9 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.TextFieldValue
@@ -67,6 +77,11 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.goings.kaidanzhushou.data.local.RecordEntity
+import com.goings.kaidanzhushou.data.local.GoodsProfileEntity
+import com.goings.kaidanzhushou.data.local.ReceiverProfileEntity
+import com.goings.kaidanzhushou.domain.AssociationFields
+import com.goings.kaidanzhushou.domain.DestinationDictionary
+import com.goings.kaidanzhushou.domain.AssociationMatcher
 import com.goings.kaidanzhushou.domain.EditableFields
 import com.goings.kaidanzhushou.domain.PaymentType
 import com.goings.kaidanzhushou.domain.RecordValidator
@@ -79,6 +94,8 @@ import kotlinx.coroutines.launch
 @Composable
 fun ReviewScreen(viewModel: MainViewModel, batchId: String, recordId: String, outerPadding: PaddingValues, onBack: () -> Unit) {
     val records by viewModel.records(batchId).collectAsStateWithLifecycle(emptyList())
+    val receiverProfiles by viewModel.receiverProfiles.collectAsStateWithLifecycle(emptyList())
+    val goodsProfiles by viewModel.goodsProfiles.collectAsStateWithLifecycle(emptyList())
     var activeRecordId by remember(recordId) { mutableStateOf(recordId) }
     val record = records.firstOrNull { it.id == activeRecordId }
     val index = records.indexOfFirst { it.id == activeRecordId }
@@ -95,6 +112,12 @@ fun ReviewScreen(viewModel: MainViewModel, batchId: String, recordId: String, ou
 
     LaunchedEffect(record?.id) {
         record?.let { if (initializedId != it.id) { fields = it.editable(); initializedId = it.id } }
+    }
+
+    LaunchedEffect(initializedId, receiverProfiles, goodsProfiles) {
+        val current = record ?: return@LaunchedEffect
+        if (initializedId != current.id) return@LaunchedEffect
+        fields = resolveExactAssociations(fields, current, receiverProfiles, goodsProfiles)
     }
 
     fun switchRecord(offset: Int): Boolean {
@@ -120,14 +143,21 @@ fun ReviewScreen(viewModel: MainViewModel, batchId: String, recordId: String, ou
                     focusManager.clearFocus()
                     keyboardController?.hide()
                     record?.let { current ->
+                        val associationIssue = when {
+                            !fields.receiverAssociationResolved -> AssociationFields.RECEIVER
+                            !fields.goodsAssociationResolved -> AssociationFields.GOODS
+                            else -> null
+                        }
                         val firstIssue = RecordValidator.validate(fields).firstOrNull()
-                        if (firstIssue == null) {
+                        if (associationIssue == null && firstIssue == null) {
                             viewModel.saveAndConfirm(current.id, fields, changedFields(current, fields), onBack)
                         } else {
                             viewModel.updateRecord(current.id, fields, changedFields(current, fields))
-                            invalidField = firstIssue.field
+                            invalidField = associationIssue ?: firstIssue?.field
                             focusAttempt += 1
-                            scope.launch { formState.animateScrollToItem(formItemIndex(firstIssue.field)) }
+                            val issueField = associationIssue ?: firstIssue?.field ?: return@let
+                            viewModel.showWarning(if (issueField == AssociationFields.RECEIVER) "请选择正确的收货人" else if (issueField == AssociationFields.GOODS) "请选择正确的货物" else firstIssue?.message.orEmpty())
+                            scope.launch { formState.animateScrollToItem(formItemIndex(issueField)) }
                         }
                     }
                 }, modifier = Modifier.weight(1f)) {
@@ -172,11 +202,27 @@ fun ReviewScreen(viewModel: MainViewModel, batchId: String, recordId: String, ou
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     item {
-                        Field(
-                            "到站 *", fields.destinationText.orEmpty(),
-                            onValue = { fields = fields.copy(destinationText = it); if (invalidField == "destination_text") invalidField = null },
+                        val dictionary = remember { viewModel.destinationDictionary() }
+                        val stations = remember(dictionary) { dictionary.stations.filterNot { it.excluded } }
+                        DestinationDropdownField(
+                            value = fields.destinationText.orEmpty(),
+                            uniqueKey = fields.destinationUniqueKey,
+                            stations = stations,
+                            suggestedKeys = remember(current.id, current.destinationCandidates) { current.destinationCandidateList() },
+                            needsReview = "destination_text" in current.uncertainFieldSet(),
                             isError = invalidField == "destination_text",
-                            selectRequest = if (invalidField == "destination_text") focusAttempt else 0,
+                            openRequest = if (invalidField == "destination_text") focusAttempt else 0,
+                            // 手打输入必须同时置 uniqueKey=null：名/键错配的行不允许流向导出。
+                            onValue = {
+                                fields = fields.copy(destinationText = it, destinationUniqueKey = null)
+                                if (invalidField == "destination_text") invalidField = null
+                            },
+                            onSelect = { station ->
+                                focusManager.clearFocus()
+                                keyboardController?.hide()
+                                fields = fields.copy(destinationText = station.name, destinationUniqueKey = station.unique_key)
+                                if (invalidField == "destination_text") invalidField = null
+                            },
                         )
                     }
                     item {
@@ -209,15 +255,79 @@ fun ReviewScreen(viewModel: MainViewModel, batchId: String, recordId: String, ou
                             }
                         }
                     }
-                    item { Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Field("发货人 *", fields.senderName.orEmpty(), { fields = fields.copy(senderName = it); if (invalidField == "sender_name") invalidField = null }, Modifier.weight(1f), isError = invalidField == "sender_name", selectRequest = if (invalidField == "sender_name") focusAttempt else 0)
-                        Field("收货人 *", fields.receiverName.orEmpty(), { fields = fields.copy(receiverName = it); if (invalidField == "receiver_name") invalidField = null }, Modifier.weight(1f), isError = invalidField == "receiver_name", selectRequest = if (invalidField == "receiver_name") focusAttempt else 0)
-                    } }
+                    item { Field("发货人 *", fields.senderName.orEmpty(), { fields = fields.copy(senderName = it); if (invalidField == "sender_name") invalidField = null }, isError = invalidField == "sender_name", selectRequest = if (invalidField == "sender_name") focusAttempt else 0) }
+                    item {
+                        ReceiverDropdownField(
+                            value = fields.receiverName.orEmpty(),
+                            profiles = receiverProfiles,
+                            unresolved = !fields.receiverAssociationResolved,
+                            isError = invalidField == "receiver_name",
+                            openRequest = if (invalidField == AssociationFields.RECEIVER || invalidField == "receiver_name") focusAttempt else 0,
+                            onValue = { next ->
+                                fields = receiverInput(fields, next, receiverProfiles)
+                                if (invalidField == "receiver_name" || invalidField == AssociationFields.RECEIVER) invalidField = null
+                            },
+                            onSelect = { profile ->
+                                fields = fields.copy(
+                                    receiverName = profile.name,
+                                    receiverMobile = profile.phone,
+                                    receiverProfileId = profile.id,
+                                    receiverAssociationResolved = true,
+                                    receiverAssociationAccepted = true,
+                                )
+                                invalidField = null
+                                focusManager.clearFocus()
+                                keyboardController?.hide()
+                            },
+                            onUseCurrent = {
+                                fields = fields.copy(
+                                    receiverProfileId = null,
+                                    receiverAssociationResolved = true,
+                                    receiverAssociationAccepted = true,
+                                )
+                                invalidField = null
+                                focusManager.clearFocus()
+                                keyboardController?.hide()
+                            },
+                        )
+                    }
                     item { Field("收货手机号", fields.receiverMobile.orEmpty(), { fields = fields.copy(receiverMobile = it) }, keyboard = KeyboardType.Phone) }
-                    item { Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Field("货物名称 *", fields.goodsName.orEmpty(), { fields = fields.copy(goodsName = it); if (invalidField == "goods_name") invalidField = null }, Modifier.weight(1f), isError = invalidField == "goods_name", selectRequest = if (invalidField == "goods_name") focusAttempt else 0)
-                        Field("包装", fields.packageName.orEmpty(), { fields = fields.copy(packageName = it) }, Modifier.weight(1f))
-                    } }
+                    item {
+                        GoodsDropdownField(
+                            value = fields.goodsName.orEmpty(),
+                            profiles = goodsProfiles,
+                            unresolved = !fields.goodsAssociationResolved,
+                            isError = invalidField == "goods_name",
+                            openRequest = if (invalidField == AssociationFields.GOODS || invalidField == "goods_name") focusAttempt else 0,
+                            onValue = { next ->
+                                fields = goodsInput(fields, next, goodsProfiles)
+                                if (invalidField == "goods_name" || invalidField == AssociationFields.GOODS) invalidField = null
+                            },
+                            onSelect = { profile ->
+                                fields = fields.copy(
+                                    goodsName = profile.name,
+                                    packageName = profile.packageName,
+                                    goodsProfileId = profile.id,
+                                    goodsAssociationResolved = true,
+                                    goodsAssociationAccepted = true,
+                                )
+                                invalidField = null
+                                focusManager.clearFocus()
+                                keyboardController?.hide()
+                            },
+                            onUseCurrent = {
+                                fields = fields.copy(
+                                    goodsProfileId = null,
+                                    goodsAssociationResolved = true,
+                                    goodsAssociationAccepted = true,
+                                )
+                                invalidField = null
+                                focusManager.clearFocus()
+                                keyboardController?.hide()
+                            },
+                        )
+                    }
+                    item { Field("包装", fields.packageName.orEmpty(), { fields = fields.copy(packageName = it) }) }
                     item { Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Field("件数 *", fields.quantity?.toString().orEmpty(), { fields = fields.copy(quantity = it.toIntOrNull()); if (invalidField == "quantity") invalidField = null }, Modifier.weight(1f), KeyboardType.Number, invalidField == "quantity", if (invalidField == "quantity") focusAttempt else 0)
                         Field("重量", fields.weight?.plain().orEmpty(), { fields = fields.copy(weight = it.toDoubleOrNull()); if (invalidField == "weight") invalidField = null }, Modifier.weight(1f), KeyboardType.Decimal, invalidField == "weight", if (invalidField == "weight") focusAttempt else 0)
@@ -367,6 +477,261 @@ internal fun IosSegments(options: List<Pair<String, String>>, selected: String?,
     }
 }
 
+/**
+ * 到站是封闭集合（当前只有通海县、玉溪市），所以下拉里始终列出全部站点，
+ * 归一给出的候选排在前面并标注。选中即同时写入标准名与 unique_key；
+ * 手打则把 unique_key 置空——名与编码错配的行不允许流向导出。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun DestinationDropdownField(
+    value: String,
+    uniqueKey: String?,
+    stations: List<DestinationDictionary.Station>,
+    suggestedKeys: List<String>,
+    needsReview: Boolean,
+    isError: Boolean,
+    openRequest: Int,
+    onValue: (String) -> Unit,
+    onSelect: (DestinationDictionary.Station) -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val focusRequester = remember { FocusRequester() }
+    var editor by remember(value) { mutableStateOf(TextFieldValue(value, TextRange(value.length))) }
+    // 归一推荐的排前面，其余按原顺序补齐，保证两个站点始终都能选到。
+    val choices = remember(stations, suggestedKeys) {
+        stations.sortedBy { station ->
+            suggestedKeys.indexOf(station.unique_key).takeIf { it >= 0 } ?: Int.MAX_VALUE
+        }
+    }
+    val offList = value.isNotBlank() && stations.none { it.name == value }
+    LaunchedEffect(value) {
+        if (editor.text != value) editor = TextFieldValue(value, TextRange(value.length))
+    }
+    LaunchedEffect(openRequest) {
+        if (openRequest > 0) {
+            focusRequester.requestFocus()
+            editor = editor.copy(selection = TextRange(0, editor.text.length))
+            expanded = true
+        }
+    }
+    val highlight = needsReview || offList
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+        OutlinedTextField(
+            value = editor,
+            onValueChange = { next -> editor = next; onValue(next.text); expanded = true },
+            label = { Text("到站 *") },
+            singleLine = true,
+            isError = isError,
+            supportingText = when {
+                offList -> ({ Text("不在常用到站里，请确认", color = com.goings.kaidanzhushou.ui.theme.Warning) })
+                needsReview -> ({ Text("到站是推定的，请核对", color = com.goings.kaidanzhushou.ui.theme.Warning) })
+                else -> null
+            },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedContainerColor = if (highlight) Color(0xFFFFF8E1) else Color.Transparent,
+                unfocusedContainerColor = if (highlight) Color(0xFFFFF8E1) else Color.Transparent,
+                focusedBorderColor = if (highlight) com.goings.kaidanzhushou.ui.theme.Warning else MaterialTheme.colorScheme.primary,
+                unfocusedBorderColor = if (highlight) com.goings.kaidanzhushou.ui.theme.Warning else MaterialTheme.colorScheme.outline,
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .menuAnchor(MenuAnchorType.PrimaryEditable, enabled = true)
+                .testTag("destination_dropdown_input")
+                .focusRequester(focusRequester)
+                .onFocusChanged { if (it.isFocused) expanded = true },
+        )
+        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            choices.forEachIndexed { index, station ->
+                val prefix = station.full_name.removeSuffix(station.name)
+                DropdownMenuItem(
+                    text = {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                                Text(station.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                if (needsReview && index == 0 && station.unique_key in suggestedKeys) {
+                                    Text("可能是这个", style = MaterialTheme.typography.labelSmall, color = com.goings.kaidanzhushou.ui.theme.Warning)
+                                }
+                            }
+                            if (prefix.isNotBlank()) {
+                                Text(prefix, maxLines = 1, style = MaterialTheme.typography.bodyMedium, color = Color.DarkGray)
+                            }
+                            if (station.unique_key == uniqueKey) {
+                                Icon(Icons.Rounded.Check, null, tint = PrimaryBlue, modifier = Modifier.padding(start = 8.dp))
+                            }
+                        }
+                    },
+                    onClick = { expanded = false; onSelect(station) },
+                    modifier = Modifier.heightIn(min = 48.dp).testTag("destination_option_${station.unique_key}"),
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun ReceiverDropdownField(
+    value: String,
+    profiles: List<ReceiverProfileEntity>,
+    unresolved: Boolean,
+    isError: Boolean,
+    openRequest: Int,
+    onValue: (String) -> Unit,
+    onSelect: (ReceiverProfileEntity) -> Unit,
+    onUseCurrent: () -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val focusRequester = remember { FocusRequester() }
+    var editor by remember(value) { mutableStateOf(TextFieldValue(value, TextRange(value.length))) }
+    val resolution = remember(value, profiles) {
+        AssociationMatcher.resolve(
+            value, profiles, ReceiverProfileEntity::normalizedName,
+            ReceiverProfileEntity::useCount, ReceiverProfileEntity::lastUsedAt,
+        )
+    }
+    val choices = resolution.candidates.map { it.value }.ifEmpty { profiles.take(5) }
+    LaunchedEffect(value) {
+        if (editor.text != value) editor = TextFieldValue(value, TextRange(value.length))
+    }
+    LaunchedEffect(openRequest) {
+        if (openRequest > 0) {
+            focusRequester.requestFocus()
+            editor = editor.copy(selection = TextRange(0, editor.text.length))
+            expanded = true
+        }
+    }
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+        OutlinedTextField(
+            value = editor,
+            onValueChange = { next -> editor = next; onValue(next.text); expanded = true },
+            label = { Text("收货人 *") },
+            singleLine = true,
+            isError = isError,
+            supportingText = if (unresolved) ({ Text("请选择正确的收货人", color = com.goings.kaidanzhushou.ui.theme.Warning) }) else null,
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedContainerColor = if (unresolved) Color(0xFFFFF8E1) else Color.Transparent,
+                unfocusedContainerColor = if (unresolved) Color(0xFFFFF8E1) else Color.Transparent,
+                focusedBorderColor = if (unresolved) com.goings.kaidanzhushou.ui.theme.Warning else MaterialTheme.colorScheme.primary,
+                unfocusedBorderColor = if (unresolved) com.goings.kaidanzhushou.ui.theme.Warning else MaterialTheme.colorScheme.outline,
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .menuAnchor(MenuAnchorType.PrimaryEditable, enabled = true)
+                .testTag("receiver_dropdown_input")
+                .focusRequester(focusRequester)
+                .onFocusChanged { if (it.isFocused) expanded = true },
+        )
+        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            choices.forEachIndexed { index, profile ->
+                DropdownMenuItem(
+                    text = {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                                Text(profile.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                if (unresolved && index == 0) Text("可能是这位", style = MaterialTheme.typography.labelSmall, color = com.goings.kaidanzhushou.ui.theme.Warning)
+                            }
+                            Text(AssociationMatcher.maskPhone(profile.phone), maxLines = 1, style = MaterialTheme.typography.bodyMedium, color = Color.DarkGray)
+                        }
+                    },
+                    onClick = { expanded = false; onSelect(profile) },
+                    modifier = Modifier.heightIn(min = 48.dp).testTag("receiver_option_${profile.id}"),
+                )
+            }
+            if (value.isNotBlank()) {
+                DropdownMenuItem(
+                    text = { Text("使用当前填写内容") },
+                    onClick = { expanded = false; onUseCurrent() },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun GoodsDropdownField(
+    value: String,
+    profiles: List<GoodsProfileEntity>,
+    unresolved: Boolean,
+    isError: Boolean,
+    openRequest: Int,
+    onValue: (String) -> Unit,
+    onSelect: (GoodsProfileEntity) -> Unit,
+    onUseCurrent: () -> Unit,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val focusRequester = remember { FocusRequester() }
+    var editor by remember(value) { mutableStateOf(TextFieldValue(value, TextRange(value.length))) }
+    val resolution = remember(value, profiles) {
+        AssociationMatcher.resolve(
+            value, profiles, GoodsProfileEntity::normalizedName,
+            GoodsProfileEntity::useCount, GoodsProfileEntity::lastUsedAt,
+        )
+    }
+    val choices = resolution.candidates.map { it.value }.ifEmpty { profiles.take(5) }
+    LaunchedEffect(value) {
+        if (editor.text != value) editor = TextFieldValue(value, TextRange(value.length))
+    }
+    LaunchedEffect(openRequest) {
+        if (openRequest > 0) {
+            focusRequester.requestFocus()
+            editor = editor.copy(selection = TextRange(0, editor.text.length))
+            expanded = true
+        }
+    }
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+        OutlinedTextField(
+            value = editor,
+            onValueChange = { next -> editor = next; onValue(next.text); expanded = true },
+            label = { Text("货物名称 *") },
+            singleLine = true,
+            isError = isError,
+            supportingText = if (unresolved) ({ Text("请选择正确的货物", color = com.goings.kaidanzhushou.ui.theme.Warning) }) else null,
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedContainerColor = if (unresolved) Color(0xFFFFF8E1) else Color.Transparent,
+                unfocusedContainerColor = if (unresolved) Color(0xFFFFF8E1) else Color.Transparent,
+                focusedBorderColor = if (unresolved) com.goings.kaidanzhushou.ui.theme.Warning else MaterialTheme.colorScheme.primary,
+                unfocusedBorderColor = if (unresolved) com.goings.kaidanzhushou.ui.theme.Warning else MaterialTheme.colorScheme.outline,
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .menuAnchor(MenuAnchorType.PrimaryEditable, enabled = true)
+                .testTag("goods_dropdown_input")
+                .focusRequester(focusRequester)
+                .onFocusChanged { if (it.isFocused) expanded = true },
+        )
+        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            choices.forEachIndexed { index, profile ->
+                DropdownMenuItem(
+                    text = {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                                Text(profile.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                if (unresolved && index == 0) Text("可能是这个", style = MaterialTheme.typography.labelSmall, color = com.goings.kaidanzhushou.ui.theme.Warning)
+                            }
+                            Text(profile.packageName, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium, color = Color.DarkGray)
+                        }
+                    },
+                    onClick = { expanded = false; onSelect(profile) },
+                    modifier = Modifier.heightIn(min = 48.dp).testTag("goods_option_${profile.id}"),
+                )
+            }
+            if (value.isNotBlank()) {
+                DropdownMenuItem(
+                    text = { Text("使用当前填写内容") },
+                    onClick = { expanded = false; onUseCurrent() },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun Field(
     label: String,
@@ -458,27 +823,100 @@ private fun formItemIndex(field: String): Int = when (field) {
     "destination_text" -> 0
     "delivery_type" -> 1
     "payment_type" -> 2
-    "sender_name", "receiver_name" -> 3
-    "receiver_mobile" -> 4
-    "goods_name", "package" -> 5
-    "quantity", "weight", "volume" -> 6
-    "freight" -> 7
+    "sender_name" -> 3
+    "receiver_name", AssociationFields.RECEIVER -> 4
+    "receiver_mobile" -> 5
+    "goods_name", AssociationFields.GOODS -> 6
+    "package" -> 7
+    "quantity", "weight", "volume" -> 8
+    "freight" -> 9
     else -> 0
 }
 
 private fun Double.plain() = if (this % 1.0 == 0.0) toLong().toString() else toString()
 
 private fun changedFields(old: RecordEntity, now: EditableFields): Set<String> = buildSet {
-    if (old.destinationText != now.destinationText) add("destination_text")
+    if (old.destinationText != now.destinationText || old.destinationUniqueKey != now.destinationUniqueKey) add("destination_text")
     if (old.deliveryType != now.deliveryType) add("delivery_type")
     if (old.senderName != now.senderName) add("sender_name")
-    if (old.receiverName != now.receiverName) add("receiver_name")
-    if (old.receiverMobile != now.receiverMobile) add("receiver_mobile")
-    if (old.goodsName != now.goodsName) add("goods_name")
-    if (old.packageName != now.packageName) add("package")
+    val receiverDecisionChanged = now.receiverAssociationAccepted || old.receiverProfileId != now.receiverProfileId ||
+        (AssociationFields.RECEIVER in old.uncertainFieldSet() && now.receiverAssociationResolved)
+    if (old.receiverName != now.receiverName || receiverDecisionChanged) add("receiver_name")
+    if (old.receiverMobile != now.receiverMobile || receiverDecisionChanged) add("receiver_mobile")
+    val goodsDecisionChanged = now.goodsAssociationAccepted || old.goodsProfileId != now.goodsProfileId ||
+        (AssociationFields.GOODS in old.uncertainFieldSet() && now.goodsAssociationResolved)
+    if (old.goodsName != now.goodsName || goodsDecisionChanged) add("goods_name")
+    if (old.packageName != now.packageName || goodsDecisionChanged) add("package")
     if (old.quantity != now.quantity) add("quantity")
     if (old.weight != now.weight) add("weight")
     if (old.volume != now.volume) add("volume")
     if (old.freight != now.freight) add("freight")
     if (old.paymentType != now.paymentType) add("payment_type")
+}
+
+private fun resolveExactAssociations(
+    fields: EditableFields,
+    record: RecordEntity,
+    receivers: List<ReceiverProfileEntity>,
+    goods: List<GoodsProfileEntity>,
+): EditableFields {
+    var resolved = fields
+    val edited = record.editedFieldSet()
+    if (receivers.isNotEmpty() && "receiver_name" !in edited && "receiver_mobile" !in edited && fields.receiverProfileId == null) {
+        resolved = receiverInput(resolved, fields.receiverName.orEmpty(), receivers)
+    }
+    if (goods.isNotEmpty() && "goods_name" !in edited && "package" !in edited && fields.goodsProfileId == null) {
+        resolved = goodsInput(resolved, fields.goodsName.orEmpty(), goods)
+    }
+    return resolved
+}
+
+private fun receiverInput(fields: EditableFields, value: String, profiles: List<ReceiverProfileEntity>): EditableFields {
+    val resolution = AssociationMatcher.resolve(
+        value, profiles, ReceiverProfileEntity::normalizedName,
+        ReceiverProfileEntity::useCount, ReceiverProfileEntity::lastUsedAt,
+    )
+    val automatic = resolution.automatic
+    return if (automatic != null) {
+        fields.copy(
+            receiverName = automatic.name,
+            receiverMobile = automatic.phone,
+            receiverProfileId = automatic.id,
+            receiverAssociationResolved = true,
+            receiverAssociationAccepted = false,
+        )
+    } else {
+        fields.copy(
+            receiverName = value,
+            receiverMobile = if (fields.receiverProfileId != null) null else fields.receiverMobile,
+            receiverProfileId = null,
+            receiverAssociationResolved = !resolution.needsChoice,
+            receiverAssociationAccepted = false,
+        )
+    }
+}
+
+private fun goodsInput(fields: EditableFields, value: String, profiles: List<GoodsProfileEntity>): EditableFields {
+    val resolution = AssociationMatcher.resolve(
+        value, profiles, GoodsProfileEntity::normalizedName,
+        GoodsProfileEntity::useCount, GoodsProfileEntity::lastUsedAt,
+    )
+    val automatic = resolution.automatic
+    return if (automatic != null) {
+        fields.copy(
+            goodsName = automatic.name,
+            packageName = automatic.packageName,
+            goodsProfileId = automatic.id,
+            goodsAssociationResolved = true,
+            goodsAssociationAccepted = false,
+        )
+    } else {
+        fields.copy(
+            goodsName = value,
+            packageName = if (fields.goodsProfileId != null) null else fields.packageName,
+            goodsProfileId = null,
+            goodsAssociationResolved = !resolution.needsChoice,
+            goodsAssociationAccepted = false,
+        )
+    }
 }

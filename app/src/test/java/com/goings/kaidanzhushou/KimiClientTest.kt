@@ -4,6 +4,7 @@ import com.goings.kaidanzhushou.data.remote.KimiClient
 import com.goings.kaidanzhushou.data.remote.KimiErrorKind
 import com.goings.kaidanzhushou.data.remote.KimiException
 import com.goings.kaidanzhushou.data.remote.SseContentParser
+import com.goings.kaidanzhushou.domain.DestinationDictionary
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
@@ -18,7 +19,22 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 
 class KimiClientTest {
-    private val payload = """{"destination_text":"杭州","delivery_type":"delivery","sender_name":"张三","receiver_name":"李四","receiver_mobile":null,"goods_name":"配件","package":null,"quantity":2,"weight":12.5,"volume":null,"freight":8,"payment_type":"pay_arrival"}"""
+    private val payload = """{"destination_raw_tokens":["玉溪","通海"],"destination_checked_token":"通海","destination_mark_type":"check","destination_layout":"checklist","destination_canonical":"通海县","delivery_type":"delivery","sender_name":"张三","receiver_name":"李四","receiver_mobile":null,"goods_name":"配件","package":null,"quantity":2,"weight":12.5,"volume":null,"freight":8,"payment_type":"pay_arrival"}"""
+
+    private val fixtureDictionary = DestinationDictionary.parse(
+        """
+        {
+          "schema": "destination-dictionary/v1",
+          "generated_at": "2026-08-15T00:00:00.000Z",
+          "stations": [
+            {"unique_key": "xzqh_id_38010", "name": "通海县", "type": 3, "showpname": "云南省玉溪市", "full_name": "云南省玉溪市通海县", "aliases": ["通海"], "excluded": false},
+            {"unique_key": "xzqh_id_37979", "name": "玉溪市", "type": 2, "showpname": "云南省", "full_name": "云南省玉溪市", "aliases": ["玉溪"], "excluded": false},
+            {"unique_key": "xzqh_id_37704", "name": "昆明市", "type": 2, "showpname": "云南省", "full_name": "云南省昆明市", "aliases": [], "excluded": true}
+          ],
+          "alias_index": {"通海县": ["xzqh_id_38010"], "通海": ["xzqh_id_38010"], "玉溪市": ["xzqh_id_37979"], "玉溪": ["xzqh_id_37979"]}
+        }
+        """.trimIndent()
+    )!!
 
     @Test fun parsesMultiChunkSse() {
         val first = payload.substring(0, 80)
@@ -37,9 +53,12 @@ class KimiClientTest {
             val chunk = "data: {\"choices\":[{\"delta\":{\"content\":${Json.encodeToString(payload)}}}]}\n\ndata: [DONE]\n\n"
             server.enqueue(MockResponse().setResponseCode(200).setHeader("Content-Type", "text/event-stream").setBody(chunk))
             val file = File.createTempFile("waybill", ".jpg").apply { writeBytes(byteArrayOf(1, 2, 3)) }
-            val client = KimiClient(OkHttpClient(), baseUrl = server.url("/v1/").toString())
+            val client = KimiClient(OkHttpClient(), baseUrl = server.url("/v1/").toString(), dictionary = { fixtureDictionary })
             val result = client.recognize("test-key", file)
-            assertEquals("杭州", result.destination_text)
+            assertEquals(listOf("玉溪", "通海"), result.destination_raw_tokens)
+            assertEquals("通海", result.destination_checked_token)
+            assertEquals("checklist", result.destination_layout)
+            assertEquals("通海县", result.destination_canonical)
             assertEquals(2, result.quantity)
             assertEquals("pay_arrival", result.payment_type)
             val request = server.takeRequest()
@@ -50,8 +69,12 @@ class KimiClientTest {
             assertTrue(requestJson.contains("pay_arrival"))
             assertTrue(requestJson.contains("pay_receipt"))
             assertTrue(requestJson.contains("发货地点永远是昆明，到站不可能是昆明"))
-            assertTrue(requestJson.contains("若单据上显示两个到站，以被打勾标注的到站为准"))
+            assertTrue(requestJson.contains("严禁把相邻的两个地名拼成一个词"))
             assertTrue(requestJson.contains("“收货方”就是收货人"))
+            // enum 注入：两个在发的站名进 schema 与站点列表；发货地昆明被排除在外。
+            assertTrue(requestJson.contains("通海县"))
+            assertTrue(requestJson.contains("玉溪市"))
+            assertTrue(!requestJson.contains("昆明市"))
             file.delete()
         } finally { server.shutdown() }
         }
@@ -59,8 +82,17 @@ class KimiClientTest {
 
     @Test fun missingFieldsAreRejected() {
         val client = KimiClient(OkHttpClient(), baseUrl = "http://localhost/")
-        val error = runCatching { client.parseDraft("{\"destination_text\":\"杭州\"}") }.exceptionOrNull() as KimiException
+        val error = runCatching { client.parseDraft("{\"destination_raw_tokens\":[\"杭州\"]}") }.exceptionOrNull() as KimiException
         assertEquals(KimiErrorKind.INVALID_RESPONSE, error.kind)
+    }
+
+    @Test fun canonicalOutsideDictionaryDegradesToNullInsteadOfThrowing() {
+        val client = KimiClient(OkHttpClient(), baseUrl = "http://localhost/", dictionary = { fixtureDictionary })
+        // 字典漂移（AI 返回了请求时字典里没有的站名）不应触发整轮重试。
+        assertEquals(null, client.parseDraft(payload.replace("通海县", "不存在站")).destination_canonical)
+        assertEquals("通海县", client.parseDraft(payload).destination_canonical)
+        // excluded 站名不在 enumNames 里，同样降级。
+        assertEquals(null, client.parseDraft(payload.replace("通海县", "昆明市")).destination_canonical)
     }
 
     @Test fun paymentTypesAreStrictAndMayBeNull() {
@@ -124,7 +156,7 @@ class KimiClientTest {
                 hedgeAfterMillis = 200,
             )
 
-            assertEquals("杭州", client.recognize("test", file).destination_text)
+            assertEquals("通海", client.recognize("test", file).destination_checked_token)
             assertEquals(2, server.requestCount)
             file.delete()
         } finally { server.shutdown() }
@@ -140,7 +172,7 @@ class KimiClientTest {
             val file = File.createTempFile("waybill", ".jpg").apply { writeBytes(byteArrayOf(1, 2, 3)) }
             val client = KimiClient(OkHttpClient(), baseUrl = server.url("/v1/").toString(), hedgeAfterMillis = 200)
 
-            assertEquals("杭州", client.recognize("test", file).destination_text)
+            assertEquals("通海", client.recognize("test", file).destination_checked_token)
             assertEquals(1, server.requestCount)
             file.delete()
         } finally { server.shutdown() }
@@ -170,7 +202,7 @@ class KimiClientTest {
                 hedgeAfterMillis = 2_500,
             )
 
-            assertEquals("杭州", client.recognize("test", file).destination_text)
+            assertEquals("通海", client.recognize("test", file).destination_checked_token)
             assertEquals(1, server.requestCount)
             file.delete()
         } finally { server.shutdown() }

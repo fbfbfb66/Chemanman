@@ -25,6 +25,7 @@ import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.FileDownload
 import androidx.compose.material.icons.rounded.Key
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.Place
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Storage
 import androidx.compose.material3.Button
@@ -99,7 +100,7 @@ fun ExportScreen(
                             if (!ready && firstUnconfirmed != null) OutlinedButton(onClick = { onReview(firstUnconfirmed.id) }) { Text("去核对") }
                         }
                         Text("已人工确认 $confirmed / ${records.size} 条", modifier = Modifier.padding(top = 8.dp))
-                        Text(if (ready) "将生成 Schema v1.1、工作表“导入数据”的 16 列标准 XLSX。" else "确认所有记录后即可导出。", color = Color.Gray)
+                        Text(if (ready) "将生成 Schema v1.2、工作表“导入数据”的 18 列标准 XLSX。" else "确认所有记录后即可导出。", color = Color.Gray)
                     }
                 }
             }
@@ -144,6 +145,7 @@ private fun shareExport(context: android.content.Context, export: ExportEntity) 
 fun SettingsScreen(viewModel: MainViewModel, outerPadding: PaddingValues, onBack: () -> Unit) {
     var key by remember { mutableStateOf("") }
     var hasKey by remember { mutableStateOf(viewModel.hasApiKey()) }
+    val dictionary = remember { viewModel.destinationDictionary() }
     androidx.compose.material3.Scaffold(containerColor = AppBackground, topBar = { AppTopBar("设置", onBack) }) { padding ->
         LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
             item {
@@ -154,6 +156,18 @@ fun SettingsScreen(viewModel: MainViewModel, outerPadding: PaddingValues, onBack
                         Button(onClick = { viewModel.saveApiKey(key); key = ""; hasKey = true }, enabled = key.isNotBlank(), modifier = Modifier.weight(1f)) { Text("安全保存") }
                         OutlinedButton(onClick = { viewModel.clearApiKey(); hasKey = false }, enabled = hasKey, modifier = Modifier.weight(1f)) { Text("清除") }
                     }
+                }
+            }
+            item {
+                SettingsCard(Icons.Rounded.Place, "到站") {
+                    val usable = dictionary.stations.filterNot { it.excluded }
+                    if (usable.isNotEmpty()) {
+                        Text(usable.joinToString("、") { it.name }, color = Success)
+                        Text("AI 只能从这些到站里选，不会再拼出系统里不存在的地名。", color = Color.Gray, modifier = Modifier.padding(top = 6.dp))
+                    } else {
+                        Text("站点表为空，到站需要全部手工填写", color = Warning)
+                    }
+                    Text("要增减到站需要更新 App（同时也要更新电脑端的油猴脚本）。", color = Color.Gray, modifier = Modifier.padding(top = 6.dp))
                 }
             }
             item {
@@ -168,7 +182,7 @@ fun SettingsScreen(viewModel: MainViewModel, outerPadding: PaddingValues, onBack
                     Text("只有开始 AI 识别后，上传副本才会发送到 Kimi。", color = Color.Gray, modifier = Modifier.padding(top = 6.dp))
                 }
             }
-            item { Text("开单助手 1.1.0 · Schema v1.1", color = Color.Gray, modifier = Modifier.fillMaxWidth().padding(12.dp)) }
+            item { Text("开单助手 1.2.0 · Schema v1.2", color = Color.Gray, modifier = Modifier.fillMaxWidth().padding(12.dp)) }
         }
     }
 }

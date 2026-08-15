@@ -18,7 +18,13 @@ enum class PaymentType(val code: String, val label: String) {
 
 @Serializable
 data class RecognitionDraft(
-    val destination_text: String? = null,
+    // 到站只做「读图取证」：raw_tokens 逐字照抄、checked_token 是带标记的那项、canonical 受字典 enum 约束。
+    // 最终写入记录的标准站名由本地 DestinationNormalizer 决定，不信 AI 的结论。
+    val destination_raw_tokens: List<String> = emptyList(),
+    val destination_checked_token: String? = null,
+    val destination_mark_type: String? = null,
+    val destination_layout: String? = null,
+    val destination_canonical: String? = null,
     val delivery_type: String? = null,
     val sender_name: String? = null,
     val receiver_name: String? = null,
@@ -30,7 +36,15 @@ data class RecognitionDraft(
     val volume: Double? = null,
     val freight: Double? = null,
     val payment_type: String? = null,
-)
+) {
+    fun destinationEvidence() = DestinationEvidence(
+        rawTokens = destination_raw_tokens,
+        checkedToken = destination_checked_token,
+        markType = destination_mark_type,
+        layout = destination_layout,
+        aiCanonical = destination_canonical,
+    )
+}
 
 data class EditableFields(
     val destinationText: String? = null,
@@ -45,6 +59,15 @@ data class EditableFields(
     val volume: Double? = null,
     val freight: Double? = null,
     val paymentType: String? = null,
+    // 与 destinationText 同生共死：人工手改文本时必须置 null（名/键错配的行不允许导出）。
+    val destinationUniqueKey: String? = null,
+    val receiverProfileId: String? = null,
+    val goodsProfileId: String? = null,
+    val receiverAssociationResolved: Boolean = true,
+    val goodsAssociationResolved: Boolean = true,
+    // 仅用于当前核对表单：记录用户明确选择了候选或“使用当前内容”。
+    val receiverAssociationAccepted: Boolean = false,
+    val goodsAssociationAccepted: Boolean = false,
 )
 
 data class ValidationIssue(val field: String, val message: String)
