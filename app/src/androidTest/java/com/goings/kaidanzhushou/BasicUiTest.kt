@@ -7,10 +7,12 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import com.goings.kaidanzhushou.data.local.GoodsProfileEntity
 import com.goings.kaidanzhushou.data.local.ReceiverProfileEntity
+import com.goings.kaidanzhushou.data.local.SenderProfileEntity
 import com.goings.kaidanzhushou.domain.PaymentType
 import com.goings.kaidanzhushou.ui.GoodsDropdownField
 import com.goings.kaidanzhushou.ui.IosSegments
 import com.goings.kaidanzhushou.ui.ReceiverDropdownField
+import com.goings.kaidanzhushou.ui.SenderDropdownField
 import com.goings.kaidanzhushou.ui.theme.KaidanTheme
 import org.junit.Assert.assertEquals
 import org.junit.Rule
@@ -37,12 +39,43 @@ class BasicUiTest {
         var selected: ReceiverProfileEntity? = null
         compose.setContent {
             KaidanTheme {
-                ReceiverDropdownField("任运飞", listOf(profile), true, false, 0, {}, { selected = it }, {})
+                ReceiverDropdownField(
+                    value = "任运飞",
+                    profiles = listOf(profile),
+                    unresolved = true,
+                    isError = false,
+                    openRequest = 0,
+                    onValue = {},
+                    onSelect = { selected = it },
+                    onUseCurrent = {},
+                )
             }
         }
+        // 警告模式：点一下就该列出可换的名字（普通模式则要打字搜到才弹）。
         compose.onNodeWithTag("receiver_dropdown_input").performClick()
         compose.onNodeWithText("150 **** 2190").assertIsDisplayed()
         compose.onNodeWithTag("receiver_option_receiver").performClick()
+        compose.runOnIdle { assertEquals(profile, selected) }
+    }
+
+    @Test fun senderDropdownSelectsProfileByName() {
+        val profile = SenderProfileEntity("sender", "昆明恒通商贸", "昆明恒通商贸", 4, 4, 1, 4)
+        var selected: SenderProfileEntity? = null
+        compose.setContent {
+            KaidanTheme {
+                SenderDropdownField(
+                    value = "昆明恒通商贸",
+                    profiles = listOf(profile),
+                    unresolved = false,
+                    isError = false,
+                    openRequest = 1,
+                    onValue = {},
+                    onSelect = { selected = it },
+                    onUseCurrent = {},
+                )
+            }
+        }
+        compose.onNodeWithTag("sender_option_sender").performClick()
         compose.runOnIdle { assertEquals(profile, selected) }
     }
 
@@ -51,10 +84,16 @@ class BasicUiTest {
         var selected: GoodsProfileEntity? = null
         compose.setContent {
             KaidanTheme {
-                GoodsDropdownField("硫酸同", listOf(profile), true, false, 0, {}, { selected = it }, {})
+                GoodsDropdownField(
+                    value = "硫酸同",
+                    profiles = listOf(profile),
+                    isError = false,
+                    openRequest = 1,
+                    onValue = {},
+                    onSelect = { selected = it },
+                )
             }
         }
-        compose.onNodeWithTag("goods_dropdown_input").performClick()
         compose.onNodeWithText("25公斤/袋").assertIsDisplayed()
         compose.onNodeWithTag("goods_option_goods").performClick()
         compose.runOnIdle { assertEquals(profile, selected) }

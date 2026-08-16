@@ -15,6 +15,7 @@ import com.goings.kaidanzhushou.data.local.ExportEntity
 
 class MainViewModel(private val container: AppContainer) : ViewModel() {
     val batches = container.repository.observeBatches()
+    val senderProfiles = container.repository.observeSenderProfiles()
     val receiverProfiles = container.repository.observeReceiverProfiles()
     val goodsProfiles = container.repository.observeGoodsProfiles()
     private val _events = MutableSharedFlow<UiNotice>(extraBufferCapacity = 4)

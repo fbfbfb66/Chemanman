@@ -24,6 +24,8 @@ class AppContainer(context: Context) {
             KaidanDatabase.MIGRATION_2_3,
             KaidanDatabase.MIGRATION_3_4,
             KaidanDatabase.MIGRATION_4_5,
+            KaidanDatabase.MIGRATION_5_6,
+            KaidanDatabase.MIGRATION_6_7,
         )
         .build()
     val imageStore = ImageStore(context)

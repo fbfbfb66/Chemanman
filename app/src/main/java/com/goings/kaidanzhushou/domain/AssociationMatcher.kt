@@ -68,6 +68,46 @@ object AssociationMatcher {
         )
     }
 
+    /**
+     * 普通模式下的下拉搜索：按「完全相同 → 前缀 → 子串 → 顺序散落」四档命中，
+     * 同档再按常用度、最近使用排。这里刻意不做纠错——纠错是 [resolve] 的活，
+     * 用来判断 AI 填的值值不值得警告；人自己打字时要的是打两个字就能捞出来。
+     */
+    fun <T> search(
+        query: String?,
+        values: List<T>,
+        normalizedName: (T) -> String,
+        useCount: (T) -> Int,
+        lastUsedAt: (T) -> Long,
+        limit: Int = 8,
+    ): List<T> {
+        val normalizedQuery = normalize(query)
+        if (normalizedQuery.isBlank()) return emptyList()
+        return values.mapNotNull { value ->
+            val name = normalizedName(value)
+            val tier = when {
+                name == normalizedQuery -> 0
+                name.startsWith(normalizedQuery) -> 1
+                name.contains(normalizedQuery) -> 2
+                isScattered(normalizedQuery, name) -> 3
+                else -> null
+            }
+            tier?.let { it to value }
+        }.sortedWith(
+            compareBy<Pair<Int, T>> { it.first }
+                .thenByDescending { useCount(it.second) }
+                .thenByDescending { lastUsedAt(it.second) },
+        ).take(limit).map { it.second }
+    }
+
+    // 「昆商」命中「昆明恒通商贸」：字按顺序出现即可。单字太泛，交给前缀/子串那两档。
+    private fun isScattered(query: String, name: String): Boolean {
+        if (query.length < 2) return false
+        var matched = 0
+        name.forEach { char -> if (matched < query.length && char == query[matched]) matched++ }
+        return matched == query.length
+    }
+
     fun editDistance(left: String, right: String): Int {
         if (left == right) return 0
         if (left.isEmpty()) return right.length
@@ -100,6 +140,8 @@ object AssociationMatcher {
 }
 
 object AssociationFields {
+    const val SENDER = "sender_profile"
     const val RECEIVER = "receiver_profile"
+    // 货物已不再要求人工确认关联；常量留着，用于把老记录里的脏 token 清掉。
     const val GOODS = "goods_profile"
 }

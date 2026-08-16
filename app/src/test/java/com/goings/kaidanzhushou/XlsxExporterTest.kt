@@ -26,6 +26,32 @@ class XlsxExporterTest {
         assertEquals("BA1", exporter.ref(52, 1))
     }
 
+    @Test fun advancePaymentGoesToTheChosenColumnAndLeavesTheOtherEmpty() {
+        val file = File.createTempFile("kaidan-advance", ".xlsx")
+        val batch = BatchEntity("batch-id", "测试批次", 1, 1, 3)
+        // 单据示例：垫付款 250、运费 30、总运费 280。
+        val records = listOf(
+            fixture(1).copy(freight = 280.0, advancePayment = 250.0, advanceReturnType = "cashreturn"),
+            fixture(2).copy(freight = 280.0, advancePayment = 250.0, advanceReturnType = "discount"),
+            fixture(3).copy(freight = 30.0),
+        )
+        XlsxExporter().write(file, batch, records)
+        XSSFWorkbook(file).use { workbook ->
+            val sheet = workbook.getSheet("导入数据")
+            assertEquals("cashreturn", sheet.getRow(0).getCell(18).stringCellValue)
+            assertEquals("discount", sheet.getRow(0).getCell(19).stringCellValue)
+            assertEquals(280.0, sheet.getRow(1).getCell(14).numericCellValue, 0.0)
+            assertEquals(250.0, sheet.getRow(1).getCell(18).numericCellValue, 0.0)
+            assertEquals(null, sheet.getRow(1).getCell(19))
+            assertEquals(null, sheet.getRow(2).getCell(18))
+            assertEquals(250.0, sheet.getRow(2).getCell(19).numericCellValue, 0.0)
+            // 没有垫付款的单子两列都不写，导出结果与升级前完全一致。
+            assertEquals(null, sheet.getRow(3).getCell(18))
+            assertEquals(null, sheet.getRow(3).getCell(19))
+        }
+        file.delete()
+    }
+
     private fun verify(count: Int) {
         val file = File.createTempFile("kaidan-$count", ".xlsx")
         val batch = BatchEntity("batch-id", "测试批次", 1, 1, 3)
@@ -36,8 +62,8 @@ class XlsxExporterTest {
             val sheet = workbook.getSheet("导入数据")
             assertEquals(count, sheet.lastRowNum)
             assertEquals(XlsxExporter.COLUMNS, XlsxExporter.COLUMNS.indices.map { sheet.getRow(0).getCell(it).stringCellValue })
-            assertEquals(18, XlsxExporter.COLUMNS.size)
-            assertEquals("v1.2", sheet.getRow(1).getCell(0).stringCellValue)
+            assertEquals(20, XlsxExporter.COLUMNS.size)
+            assertEquals("v1.3", sheet.getRow(1).getCell(0).stringCellValue)
             assertEquals("pay_billing", sheet.getRow(1).getCell(15).stringCellValue)
             assertEquals("xzqh_id_38010", sheet.getRow(1).getCell(16).stringCellValue)
             assertEquals("云南省玉溪市通海县", sheet.getRow(1).getCell(17).stringCellValue)

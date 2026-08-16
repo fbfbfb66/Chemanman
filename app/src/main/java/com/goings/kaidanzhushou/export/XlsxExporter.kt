@@ -38,6 +38,9 @@ class XlsxExporter {
                 Cell.Text(record.packageName), Cell.Number(record.quantity), Cell.Number(record.weight),
                 Cell.Number(record.volume), Cell.Number(record.freight), Cell.Text(record.paymentType),
                 Cell.Text(record.destinationUniqueKey), Cell.Text(record.destinationDisplay),
+                // 垫付款按人工选定的去向分流到其中一列，另一列留空；两列同时有值是脚本会拒绝的非法状态。
+                Cell.Number(record.advancePayment.takeIf { record.advanceReturnType == "cashreturn" }),
+                Cell.Number(record.advancePayment.takeIf { record.advanceReturnType == "discount" }),
             )
             values.forEachIndexed { column, value ->
                 when (value) {
@@ -84,11 +87,13 @@ class XlsxExporter {
     }
 
     companion object {
-        const val SCHEMA_VERSION = "v1.2"
+        const val SCHEMA_VERSION = "v1.3"
+        // 新列一律追加到末尾：油猴脚本按列名定位，旧版脚本读不到新列也不会错位。
         val COLUMNS = listOf(
             "schema_version", "batch_id", "source_record_id", "source_label", "destination_text", "delivery_type",
             "sender_name", "receiver_name", "receiver_mobile", "goods_name", "package", "quantity", "weight",
             "volume", "freight", "payment_type", "destination_unique_key", "destination_display",
+            "cashreturn", "discount",
         )
     }
 }
