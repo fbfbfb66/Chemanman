@@ -11,11 +11,12 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         BatchEntity::class,
         RecordEntity::class,
         ExportEntity::class,
+        SenderProfileEntity::class,
         ReceiverProfileEntity::class,
         GoodsProfileEntity::class,
         ProfileLearningStateEntity::class,
     ],
-    version = 5,
+    version = 7,
     exportSchema = false,
 )
 @TypeConverters(Converters::class)
@@ -82,6 +83,32 @@ abstract class KaidanDatabase : RoomDatabase() {
                         completedAt INTEGER NOT NULL
                     )
                 """.trimIndent())
+            }
+        }
+        // 旧记录本来就没有垫付款，两列留空即可，不做任何回填。
+        val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE records ADD COLUMN advancePayment REAL")
+                db.execSQL("ALTER TABLE records ADD COLUMN advanceReturnType TEXT")
+            }
+        }
+        // 发货人常用档案：老记录的关联列留空，历史回填由 sender_history_v1 那一趟负责。
+        val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE records ADD COLUMN senderProfileId TEXT")
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS sender_profiles (
+                        id TEXT NOT NULL PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        normalizedName TEXT NOT NULL,
+                        useCount INTEGER NOT NULL,
+                        lastUsedAt INTEGER NOT NULL,
+                        createdAt INTEGER NOT NULL,
+                        updatedAt INTEGER NOT NULL
+                    )
+                """.trimIndent())
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_sender_profiles_normalizedName ON sender_profiles(normalizedName)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_sender_profiles_lastUsedAt ON sender_profiles(lastUsedAt)")
             }
         }
     }

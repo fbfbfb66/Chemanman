@@ -196,7 +196,7 @@ class KimiClient(
             put("response_format", buildJsonObject {
                 put("type", JsonPrimitive("json_schema"))
                 put("json_schema", buildJsonObject {
-                    put("name", JsonPrimitive("waybill_record_v1_2"))
+                    put("name", JsonPrimitive("waybill_record_v1_3"))
                     put("strict", JsonPrimitive(true))
                     put("schema", schema(dict))
                 })
@@ -236,7 +236,7 @@ class KimiClient(
                     put("enum", JsonArray(listOf(JsonPrimitive("pay_billing"), JsonPrimitive("pay_arrival"), JsonPrimitive("pay_receipt"), JsonNull)))
                 })
                 put("quantity", buildJsonObject { put("type", nullable("integer")); put("minimum", JsonPrimitive(1)) })
-                listOf("weight", "volume", "freight").forEach {
+                listOf("weight", "volume", "freight_fee", "advance_payment", "total_freight").forEach {
                     put(it, buildJsonObject { put("type", nullable("number")); put("minimum", JsonPrimitive(0)) })
                 }
             })
@@ -266,9 +266,11 @@ class KimiClient(
             "destination_raw_tokens", "destination_checked_token", "destination_mark_type",
             "destination_layout", "destination_canonical",
             "delivery_type", "sender_name", "receiver_name", "receiver_mobile",
-            "goods_name", "package", "quantity", "weight", "volume", "freight", "payment_type",
+            "goods_name", "package", "quantity", "weight", "volume",
+            "freight_fee", "advance_payment", "total_freight", "payment_type",
         )
-        const val PROMPT_BASE = """你是托运单录入助手。只提取图片中明确可见的信息，禁止推测、补全或编造。无法确认的字段必须返回 null。delivery_type 只能是 delivery（送货）或 pickup（自提）。付款方式严格映射：单据写“现付”返回 payment_type=pay_billing；写“提付”或“到付”返回 pay_arrival；写“回付”返回 pay_receipt；看不清则返回 null。quantity 为件数；weight、volume、freight 仅返回数字。单据中的“收货方”就是收货人，填入 receiver_name。
+        const val PROMPT_BASE = """你是托运单录入助手。只提取图片中明确可见的信息，禁止推测、补全或编造。无法确认的字段必须返回 null。宁可返回 null 也不要猜：填进去的字段会被当成可信数据直接用，猜错一个字段给人工核对带来的负担远大于留空。凡是字迹模糊、被遮挡、栏位含义拿不准、需要靠常识补全的，一律返回 null。delivery_type 只能是 delivery（送货）或 pickup（自提）。付款方式严格映射：单据写“现付”返回 payment_type=pay_billing；写“提付”或“到付”返回 pay_arrival；写“回付”返回 pay_receipt；看不清则返回 null。quantity 为件数；weight、volume、freight_fee、advance_payment、total_freight 仅返回数字。单据中的“收货方”就是收货人，填入 receiver_name。
+费用栏常见三个数：运费、垫付款、总运费。不同单据叫法不同，按语义对应——垫付款也可能写作垫付、代垫、垫付费、垫付运费；总运费也可能写作合计运费、运费合计、运费总计、总计。这三个字段全都只做“照抄”：freight_fee 只抄“运费”那一栏的数字，advance_payment 只抄“垫付款”那一栏的数字，total_freight 只抄“总运费”那一栏的数字。禁止心算、禁止把两栏相加、禁止用其中两栏去推第三栏；哪一栏不存在、空白或看不清，对应字段就返回 null，加总与核对全部由软件完成。几乎每张单都有运费，很多单据只写运费这一个数：这种情况把它填进 freight_fee，advance_payment 和 total_freight 一律返回 null，软件会认定总运费等于运费。advance_payment 只在单据上真的写着“垫付款/垫付/代垫/垫付费”字样的那一栏里有数字时才填，绝不能把运费的数字抄进 advance_payment；单据上没有垫付款这一栏，advance_payment 就必须是 null。注意“代收货款”“保价费”“声明价值”都不是垫付款，不要混填。
 到站字段只做“读图取证”，不要下结论：destination_raw_tokens 逐项照抄单据上出现的到站文字，一个格子或一个词一项，严禁把相邻的两个地名拼成一个词，严禁补上单据里没有的“市”“县”等字。若某一项带勾、圆圈或下划线标记，把该项原文放进 destination_checked_token，并在 destination_mark_type 填 check/circle/underline；没有任何标记就都返回 null。版面是印刷好的勾选表时 destination_layout 填 checklist，是手写的填 handwritten，看不清填 null。destination_canonical 只在你有十足把握判断标准到站时从列表中选择，拿不准一律返回 null。发货地点永远是昆明，到站不可能是昆明。"""
     }
 }

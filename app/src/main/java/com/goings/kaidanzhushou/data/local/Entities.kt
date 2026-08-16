@@ -53,7 +53,11 @@ data class RecordEntity(
     val quantity: Int? = null,
     val weight: Double? = null,
     val volume: Double? = null,
+    // freight 是「总运费」（运费 + 垫付款）；advancePayment 是其中的垫付款，
+    // advanceReturnType 是人工选定的去向（cashreturn 现返 / discount 欠返）。
     val freight: Double? = null,
+    val advancePayment: Double? = null,
+    val advanceReturnType: String? = null,
     val paymentType: String? = null,
     val documentPath: String? = null,
     val edgeDetectionWarning: Boolean = false,
@@ -69,6 +73,7 @@ data class RecordEntity(
     val destinationDisplay: String = "",
     val destinationCandidates: String = "",
     // 关联 ID 只描述用户选择的常用信息；运单字段仍保存独立快照，导出不依赖关联表。
+    val senderProfileId: String? = null,
     val receiverProfileId: String? = null,
     val goodsProfileId: String? = null,
     val updatedAt: Long = capturedAt,
@@ -77,11 +82,13 @@ data class RecordEntity(
         destinationText = destinationText, deliveryType = deliveryType, senderName = senderName,
         receiverName = receiverName, receiverMobile = receiverMobile, goodsName = goodsName,
         packageName = packageName, quantity = quantity, weight = weight, volume = volume,
-        freight = freight, paymentType = paymentType, destinationUniqueKey = destinationUniqueKey,
+        freight = freight, advancePayment = advancePayment, advanceReturnType = advanceReturnType,
+        paymentType = paymentType, destinationUniqueKey = destinationUniqueKey,
+        senderProfileId = senderProfileId,
         receiverProfileId = receiverProfileId,
         goodsProfileId = goodsProfileId,
+        senderAssociationResolved = AssociationFields.SENDER !in uncertainFieldSet(),
         receiverAssociationResolved = AssociationFields.RECEIVER !in uncertainFieldSet(),
-        goodsAssociationResolved = AssociationFields.GOODS !in uncertainFieldSet(),
     )
 
     fun destinationCandidateList(): List<String> = destinationCandidates.split(',').filter(String::isNotBlank)
@@ -89,6 +96,21 @@ data class RecordEntity(
     fun uncertainFieldSet(): Set<String> = uncertainFields.split(',').filter(String::isNotBlank).toSet()
     fun editedFieldSet(): Set<String> = editedFields.split(',').filter(String::isNotBlank).toSet()
 }
+
+// 发货人没有第二字段（收货人有手机号、货物有包装），同名即同一档案。
+@Entity(
+    tableName = "sender_profiles",
+    indices = [Index("normalizedName"), Index("lastUsedAt")],
+)
+data class SenderProfileEntity(
+    @PrimaryKey val id: String,
+    val name: String,
+    val normalizedName: String,
+    val useCount: Int,
+    val lastUsedAt: Long,
+    val createdAt: Long,
+    val updatedAt: Long,
+)
 
 @Entity(
     tableName = "receiver_profiles",

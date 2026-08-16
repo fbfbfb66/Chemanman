@@ -19,7 +19,7 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 
 class KimiClientTest {
-    private val payload = """{"destination_raw_tokens":["玉溪","通海"],"destination_checked_token":"通海","destination_mark_type":"check","destination_layout":"checklist","destination_canonical":"通海县","delivery_type":"delivery","sender_name":"张三","receiver_name":"李四","receiver_mobile":null,"goods_name":"配件","package":null,"quantity":2,"weight":12.5,"volume":null,"freight":8,"payment_type":"pay_arrival"}"""
+    private val payload = """{"destination_raw_tokens":["玉溪","通海"],"destination_checked_token":"通海","destination_mark_type":"check","destination_layout":"checklist","destination_canonical":"通海县","delivery_type":"delivery","sender_name":"张三","receiver_name":"李四","receiver_mobile":null,"goods_name":"配件","package":null,"quantity":2,"weight":12.5,"volume":null,"freight_fee":8,"advance_payment":null,"total_freight":null,"payment_type":"pay_arrival"}"""
 
     private val fixtureDictionary = DestinationDictionary.parse(
         """
@@ -71,6 +71,11 @@ class KimiClientTest {
             assertTrue(requestJson.contains("发货地点永远是昆明，到站不可能是昆明"))
             assertTrue(requestJson.contains("严禁把相邻的两个地名拼成一个词"))
             assertTrue(requestJson.contains("“收货方”就是收货人"))
+            assertTrue(requestJson.contains("禁止心算、禁止把两栏相加"))
+            assertTrue(requestJson.contains("宁可返回 null 也不要猜"))
+            assertTrue(requestJson.contains("绝不能把运费的数字抄进 advance_payment"))
+            assertTrue(requestJson.contains("advance_payment"))
+            assertTrue(requestJson.contains("total_freight"))
             // enum 注入：两个在发的站名进 schema 与站点列表；发货地昆明被排除在外。
             assertTrue(requestJson.contains("通海县"))
             assertTrue(requestJson.contains("玉溪市"))
@@ -103,6 +108,20 @@ class KimiClientTest {
         val invalid = runCatching { client.parseDraft(payload.replace("pay_arrival", "cash")) }.exceptionOrNull() as KimiException
         assertEquals(KimiErrorKind.INVALID_RESPONSE, invalid.kind)
         assertEquals(null, client.parseDraft(payload.replace("\"pay_arrival\"", "null")).payment_type)
+    }
+
+    @Test fun feeColumnsAreCopiedRawAndMayBeNull() {
+        val client = KimiClient(OkHttpClient(), baseUrl = "http://localhost/")
+        assertEquals(null, client.parseDraft(payload).advance_payment)
+        assertEquals(null, client.parseDraft(payload).total_freight)
+        // 单据示例：运费 30、垫付款 250、总运费 280 —— 三栏都只照抄，加总在 FeeReconciler 里做。
+        val withFees = payload.replace(
+            "\"freight_fee\":8,\"advance_payment\":null,\"total_freight\":null",
+            "\"freight_fee\":30,\"advance_payment\":250,\"total_freight\":280",
+        )
+        assertEquals(30.0, client.parseDraft(withFees).freight_fee)
+        assertEquals(250.0, client.parseDraft(withFees).advance_payment)
+        assertEquals(280.0, client.parseDraft(withFees).total_freight)
     }
 
     @Test fun rateLimitCarriesRetryAfter() {

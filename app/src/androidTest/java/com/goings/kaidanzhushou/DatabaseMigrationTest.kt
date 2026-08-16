@@ -93,4 +93,54 @@ class DatabaseMigrationTest {
         helper.close()
         context.deleteDatabase(name)
     }
+
+    @Test fun migration5To6AddsAdvancePaymentColumnsAsNull() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val name = "migration-5-6-${System.nanoTime()}.db"
+        val helper = FrameworkSQLiteOpenHelperFactory().create(
+            SupportSQLiteOpenHelper.Configuration.builder(context).name(name).callback(object : SupportSQLiteOpenHelper.Callback(1) {
+                override fun onCreate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL("CREATE TABLE records (id TEXT NOT NULL PRIMARY KEY, freight REAL)")
+                    db.execSQL("INSERT INTO records(id, freight) VALUES ('legacy', 20.0)")
+                }
+                override fun onUpgrade(db: androidx.sqlite.db.SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+            }).build()
+        )
+        val db = helper.writableDatabase
+        KaidanDatabase.MIGRATION_5_6.migrate(db)
+        db.query("SELECT freight, advancePayment, advanceReturnType FROM records WHERE id='legacy'").use { cursor ->
+            cursor.moveToFirst()
+            assertEquals(20.0, cursor.getDouble(0), 0.0)
+            assertEquals(true, cursor.isNull(1))
+            assertEquals(true, cursor.isNull(2))
+        }
+        helper.close()
+        context.deleteDatabase(name)
+    }
+
+    @Test fun migration6To7AddsSenderProfilesAndRecordLink() {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val name = "migration-6-7-${System.nanoTime()}.db"
+        val helper = FrameworkSQLiteOpenHelperFactory().create(
+            SupportSQLiteOpenHelper.Configuration.builder(context).name(name).callback(object : SupportSQLiteOpenHelper.Callback(1) {
+                override fun onCreate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL("CREATE TABLE records (id TEXT NOT NULL PRIMARY KEY)")
+                    db.execSQL("INSERT INTO records(id) VALUES ('legacy')")
+                }
+                override fun onUpgrade(db: androidx.sqlite.db.SupportSQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+            }).build()
+        )
+        val db = helper.writableDatabase
+        KaidanDatabase.MIGRATION_6_7.migrate(db)
+        db.query("SELECT senderProfileId FROM records WHERE id='legacy'").use { cursor ->
+            cursor.moveToFirst()
+            assertEquals(true, cursor.isNull(0))
+        }
+        db.query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sender_profiles'").use { cursor ->
+            cursor.moveToFirst()
+            assertEquals(1, cursor.getInt(0))
+        }
+        helper.close()
+        context.deleteDatabase(name)
+    }
 }

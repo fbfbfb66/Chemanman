@@ -9,10 +9,13 @@ import com.goings.kaidanzhushou.data.local.KaidanDatabase
 import com.goings.kaidanzhushou.data.local.ProfileLearningStateEntity
 import com.goings.kaidanzhushou.data.local.RecordEntity
 import com.goings.kaidanzhushou.data.local.ReceiverProfileEntity
+import com.goings.kaidanzhushou.data.local.SenderProfileEntity
 import com.goings.kaidanzhushou.domain.AssociationFields
 import com.goings.kaidanzhushou.domain.AssociationMatcher
 import com.goings.kaidanzhushou.domain.DestinationResolution
 import com.goings.kaidanzhushou.domain.EditableFields
+import com.goings.kaidanzhushou.domain.FeeReconciler
+import com.goings.kaidanzhushou.domain.normalizeAdvancePayment
 import com.goings.kaidanzhushou.domain.RecognitionDraft
 import com.goings.kaidanzhushou.domain.RecognitionStatus
 import com.goings.kaidanzhushou.domain.RecordValidator
@@ -34,28 +37,38 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
     fun observeRecords(batchId: String) = dao.observeRecords(batchId)
     fun observeRecord(id: String) = dao.observeRecord(id)
     fun observeExports(batchId: String) = dao.observeExports(batchId)
+    fun observeSenderProfiles() = dao.observeSenderProfiles()
     fun observeReceiverProfiles() = dao.observeReceiverProfiles()
     fun observeGoodsProfiles() = dao.observeGoodsProfiles()
 
     suspend fun seedProfilesFromConfirmedRecords() {
         db.withTransaction {
-            if (dao.getProfileLearningState(PROFILE_SEED_KEY) != null) return@withTransaction
-            dao.getConfirmedRecords().forEach { record ->
-                val receiverId = learnReceiver(
-                    name = record.receiverName,
-                    phone = record.receiverMobile,
-                    selectedId = record.receiverProfileId,
-                    usedAt = record.updatedAt,
-                )
-                val goodsId = learnGoods(
-                    name = record.goodsName,
-                    packageName = record.packageName,
-                    selectedId = record.goodsProfileId,
-                    usedAt = record.updatedAt,
-                )
-                dao.updateRecordProfileLinks(record.id, receiverId, goodsId)
+            if (dao.getProfileLearningState(PROFILE_SEED_KEY) == null) {
+                dao.getConfirmedRecords().forEach { record ->
+                    val receiverId = learnReceiver(
+                        name = record.receiverName,
+                        phone = record.receiverMobile,
+                        selectedId = record.receiverProfileId,
+                        usedAt = record.updatedAt,
+                    )
+                    val goodsId = learnGoods(
+                        name = record.goodsName,
+                        packageName = record.packageName,
+                        selectedId = record.goodsProfileId,
+                        usedAt = record.updatedAt,
+                    )
+                    dao.updateRecordProfileLinks(record.id, receiverId, goodsId)
+                }
+                dao.putProfileLearningState(ProfileLearningStateEntity(PROFILE_SEED_KEY, System.currentTimeMillis()))
             }
-            dao.putProfileLearningState(ProfileLearningStateEntity(PROFILE_SEED_KEY, System.currentTimeMillis()))
+            // 发货人档案是后加的，老设备早就消费掉了上面那个 key，只能另起一趟。
+            if (dao.getProfileLearningState(SENDER_SEED_KEY) == null) {
+                dao.getConfirmedRecords().forEach { record ->
+                    val senderId = learnSender(record.senderName, record.senderProfileId, record.updatedAt)
+                    dao.updateRecordSenderProfileLink(record.id, senderId)
+                }
+                dao.putProfileLearningState(ProfileLearningStateEntity(SENDER_SEED_KEY, System.currentTimeMillis()))
+            }
         }
     }
 
@@ -148,7 +161,12 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
                 editedFields = edited,
                 uncertainFields = uncertain,
                 destinationDisplay = destinationDisplay,
-                reviewStatus = if (issues.isEmpty() && old.reviewStatus == ReviewStatus.CONFIRMED) ReviewStatus.CONFIRMED else ReviewStatus.NEEDS_REVIEW,
+                // 已确认的记录只在「什么都没改」时保持确认态：真动了字段就得重新确认一次。
+                reviewStatus = if (issues.isEmpty() && changed.isEmpty() && old.reviewStatus == ReviewStatus.CONFIRMED) {
+                    ReviewStatus.CONFIRMED
+                } else {
+                    ReviewStatus.NEEDS_REVIEW
+                },
                 updatedAt = System.currentTimeMillis(),
             ))
             dao.bumpRevision(old.batchId)
@@ -168,8 +186,8 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
     ): List<String> = db.withTransaction {
         val old = dao.getRecord(recordId) ?: return@withTransaction listOf("记录不存在")
         val messages = RecordValidator.validate(fields).map { it.message }.toMutableList()
+        if (!fields.senderAssociationResolved) messages += "请选择正确的发货人"
         if (!fields.receiverAssociationResolved) messages += "请选择正确的收货人"
-        if (!fields.goodsAssociationResolved) messages += "请选择正确的货物"
         val now = System.currentTimeMillis()
         val uncertain = updatedUncertainFields(old, fields, changed)
         val edited = (old.editedFieldSet() + changed).sorted().joinToString(",")
@@ -179,14 +197,20 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
             return@withTransaction messages
         }
 
+        val senderId = learnSender(fields.senderName, fields.senderProfileId, now)
         val receiverId = learnReceiver(fields.receiverName, fields.receiverMobile, fields.receiverProfileId, now)
         val goodsId = learnGoods(fields.goodsName, fields.packageName, fields.goodsProfileId, now)
-        val confirmedFields = fields.copy(receiverProfileId = receiverId, goodsProfileId = goodsId)
+        val confirmedFields = fields.copy(
+            senderProfileId = senderId,
+            receiverProfileId = receiverId,
+            goodsProfileId = goodsId,
+        )
         dao.updateRecord(copyFields(
             old = old,
             fields = confirmedFields,
             editedFields = edited,
-            uncertainFields = uncertain,
+            // 人工确认过就没有「待核对」可言了：整条记录的黄色标记一次清空。
+            uncertainFields = "",
             destinationDisplay = destinationDisplay,
             reviewStatus = ReviewStatus.CONFIRMED,
             updatedAt = now,
@@ -205,8 +229,23 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
             val edited = old.editedFieldSet()
             fun <T> keep(field: String, current: T?, ai: T?): T? = if (field in edited) current else ai
             val destinationEdited = "destination_text" in edited
+            val senderEdited = "sender_name" in edited
             val receiverEdited = "receiver_name" in edited || "receiver_mobile" in edited
             val goodsEdited = "goods_name" in edited || "package" in edited
+            // 费用两字段按「一对」保护：只保留其中一个会拼出「人工总运费 + AI 垫付款」的错配。
+            val feeEdited = "freight" in edited || "advance_payment" in edited
+            val fee = if (feeEdited) null else FeeReconciler.reconcile(
+                freightFee = draft.freight_fee,
+                advancePayment = normalizeAdvancePayment(draft.advance_payment),
+                totalFreight = draft.total_freight,
+            )
+            val senderResolution = if (senderEdited) null else AssociationMatcher.resolve(
+                query = draft.sender_name,
+                values = dao.getSenderProfiles(),
+                normalizedName = SenderProfileEntity::normalizedName,
+                useCount = SenderProfileEntity::useCount,
+                lastUsedAt = SenderProfileEntity::lastUsedAt,
+            )
             val receiverResolution = if (receiverEdited) null else AssociationMatcher.resolve(
                 query = draft.receiver_name,
                 values = dao.getReceiverProfiles(),
@@ -221,6 +260,7 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
                 useCount = GoodsProfileEntity::useCount,
                 lastUsedAt = GoodsProfileEntity::lastUsedAt,
             )
+            val automaticSender = senderResolution?.automatic
             val automaticReceiver = receiverResolution?.automatic
             val automaticGoods = goodsResolution?.automatic
             val uncertain = old.uncertainFieldSet().toMutableSet().apply {
@@ -228,15 +268,22 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
                     remove("destination_text")
                     if (resolution.needsReview) add("destination_text")
                 }
+                if (!senderEdited) {
+                    remove(AssociationFields.SENDER)
+                    if (senderResolution?.needsChoice == true) add(AssociationFields.SENDER)
+                }
                 if (!receiverEdited) {
                     remove(AssociationFields.RECEIVER)
                     if (receiverResolution?.needsChoice == true) add(AssociationFields.RECEIVER)
                 }
-                if (!goodsEdited) {
-                    remove(AssociationFields.GOODS)
-                    if (goodsResolution?.needsChoice == true) add(AssociationFields.GOODS)
+                // 货物只做下拉辅助，不再要求人工确认关联。
+                remove(AssociationFields.GOODS)
+                if (!feeEdited) {
+                    remove(FeeReconciler.UNCERTAIN_TOKEN)
+                    if (fee?.needsReview == true) add(FeeReconciler.UNCERTAIN_TOKEN)
                 }
             }.sorted().joinToString(",")
+            val advancePayment = if (feeEdited) old.advancePayment else fee?.advancePayment
             val updated = old.copy(
                 recognitionStatus = RecognitionStatus.PARSED,
                 reviewStatus = ReviewStatus.NEEDS_REVIEW,
@@ -246,7 +293,8 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
                 destinationDisplay = if (destinationEdited) old.destinationDisplay else resolution.display,
                 destinationCandidates = if (destinationEdited) old.destinationCandidates else resolution.candidates.joinToString(","),
                 deliveryType = keep("delivery_type", old.deliveryType, draft.delivery_type),
-                senderName = keep("sender_name", old.senderName, draft.sender_name),
+                senderName = if (senderEdited) old.senderName else automaticSender?.name ?: draft.sender_name,
+                senderProfileId = if (senderEdited) old.senderProfileId else automaticSender?.id,
                 receiverName = if (receiverEdited) old.receiverName else automaticReceiver?.name ?: draft.receiver_name,
                 receiverMobile = if (receiverEdited) old.receiverMobile else automaticReceiver?.phone ?: draft.receiver_mobile,
                 receiverProfileId = if (receiverEdited) old.receiverProfileId else automaticReceiver?.id,
@@ -256,7 +304,10 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
                 quantity = keep("quantity", old.quantity, draft.quantity),
                 weight = keep("weight", old.weight, draft.weight),
                 volume = keep("volume", old.volume, draft.volume),
-                freight = keep("freight", old.freight, draft.freight),
+                freight = if (feeEdited) old.freight else fee?.freight,
+                // AI 只出金额；去向由人工选，重识别保留已选结果，但金额没了就一并清掉。
+                advancePayment = advancePayment,
+                advanceReturnType = old.advanceReturnType.takeIf { advancePayment != null },
                 paymentType = keep("payment_type", old.paymentType, draft.payment_type),
                 uncertainFields = uncertain,
                 notes = null,
@@ -270,8 +321,11 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
     private fun updatedUncertainFields(old: RecordEntity, fields: EditableFields, changed: Set<String>): String =
         old.uncertainFieldSet().toMutableSet().apply {
             if ("destination_text" in changed) remove("destination_text")
+            if (fields.senderAssociationResolved) remove(AssociationFields.SENDER) else add(AssociationFields.SENDER)
             if (fields.receiverAssociationResolved) remove(AssociationFields.RECEIVER) else add(AssociationFields.RECEIVER)
-            if (fields.goodsAssociationResolved) remove(AssociationFields.GOODS) else add(AssociationFields.GOODS)
+            // 货物拦截已废除，顺手把老记录里残留的 token 清掉。
+            remove(AssociationFields.GOODS)
+            if ("freight" in changed || "advance_payment" in changed) remove(FeeReconciler.UNCERTAIN_TOKEN)
         }.sorted().joinToString(",")
 
     private fun copyFields(
@@ -286,6 +340,7 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
         destinationText = fields.destinationText,
         deliveryType = fields.deliveryType,
         senderName = fields.senderName,
+        senderProfileId = fields.senderProfileId,
         receiverName = fields.receiverName,
         receiverMobile = fields.receiverMobile,
         receiverProfileId = fields.receiverProfileId,
@@ -296,6 +351,8 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
         weight = fields.weight,
         volume = fields.volume,
         freight = fields.freight,
+        advancePayment = fields.advancePayment,
+        advanceReturnType = fields.advanceReturnType,
         paymentType = fields.paymentType,
         destinationUniqueKey = fields.destinationUniqueKey,
         destinationDisplay = when {
@@ -308,6 +365,28 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
         reviewStatus = reviewStatus,
         updatedAt = updatedAt,
     )
+
+    // 发货人没有第二字段可比对，normalizedName 就是身份：同名即同一档案，
+    // 所以不需要收货人那套 merge/replaceLinks 分支。
+    private suspend fun learnSender(name: String?, selectedId: String?, usedAt: Long): String? {
+        val cleanName = name?.trim().orEmpty()
+        if (cleanName.isBlank()) return selectedId
+        val normalizedName = AssociationMatcher.normalize(cleanName)
+        if (normalizedName.isBlank()) return selectedId
+        val existing = dao.getSenderProfilesByName(normalizedName).firstOrNull()
+        if (existing != null) {
+            dao.updateSenderProfile(existing.copy(
+                name = cleanName,
+                useCount = existing.useCount + 1,
+                lastUsedAt = maxOf(existing.lastUsedAt, usedAt),
+                updatedAt = maxOf(existing.updatedAt, usedAt),
+            ))
+            return existing.id
+        }
+        val id = UUID.randomUUID().toString()
+        dao.insertSenderProfile(SenderProfileEntity(id, cleanName, normalizedName, 1, usedAt, usedAt, usedAt))
+        return id
+    }
 
     private suspend fun learnReceiver(
         name: String?,
@@ -410,5 +489,6 @@ class BatchRepository(private val db: KaidanDatabase, private val images: ImageS
 
     companion object {
         private const val PROFILE_SEED_KEY = "confirmed_history_v1"
+        private const val SENDER_SEED_KEY = "sender_history_v1"
     }
 }

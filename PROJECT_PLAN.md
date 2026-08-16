@@ -103,9 +103,9 @@ v1.0.13 已完成最终实站验收：TEST-0001～TEST-0006 连续 6 条全部�
 
 ## 5. Excel 交换契约
 
-当前 Schema 版本为 `v1.0`，以现有测试 Excel 和 v0.1.6 脚本为基线。
+当前 Schema 版本为 `v1.3`。新列一律追加到末尾且为可选列，旧版本表格照常导入。
 
-当前字段包括：
+必需字段（v1.0 起）：
 
 - `schema_version`
 - `batch_id`
@@ -121,8 +121,13 @@ v1.0.13 已完成最终实站验收：TEST-0001～TEST-0006 连续 6 条全部�
 - `quantity`
 - `weight`
 - `volume`
-- `freight`
+- `freight`（**总运费** = 运费 + 垫付款）
 - `payment_type`
+
+可选字段：
+
+- `destination_unique_key`、`destination_display`（v1.2 起）—— 到站在车满满字典里的编码与上级全称。
+- `cashreturn`、`discount`（v1.3 起）—— 单据上的垫付款，按录单人选定的去向落到现返或欠返其一，至多一个非空，且不得超过 `freight`。
 
 约束：
 

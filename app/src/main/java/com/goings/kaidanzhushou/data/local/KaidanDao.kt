@@ -91,6 +91,23 @@ interface KaidanDao {
     @Query("SELECT * FROM exports WHERE batchId = :batchId ORDER BY exportedAt DESC")
     fun observeExports(batchId: String): Flow<List<ExportEntity>>
 
+    @Query("SELECT * FROM sender_profiles ORDER BY lastUsedAt DESC, useCount DESC, name")
+    fun observeSenderProfiles(): Flow<List<SenderProfileEntity>>
+
+    @Query("SELECT * FROM sender_profiles ORDER BY lastUsedAt DESC, useCount DESC, name")
+    suspend fun getSenderProfiles(): List<SenderProfileEntity>
+
+    @Query("SELECT * FROM sender_profiles WHERE normalizedName = :normalizedName ORDER BY lastUsedAt DESC, useCount DESC")
+    suspend fun getSenderProfilesByName(normalizedName: String): List<SenderProfileEntity>
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertSenderProfile(profile: SenderProfileEntity)
+
+    @Update suspend fun updateSenderProfile(profile: SenderProfileEntity)
+
+    @Query("UPDATE records SET senderProfileId = :senderProfileId WHERE id = :id")
+    suspend fun updateRecordSenderProfileLink(id: String, senderProfileId: String?)
+
     @Query("SELECT * FROM receiver_profiles ORDER BY lastUsedAt DESC, useCount DESC, name")
     fun observeReceiverProfiles(): Flow<List<ReceiverProfileEntity>>
 

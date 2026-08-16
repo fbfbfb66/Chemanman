@@ -1,6 +1,7 @@
 package com.goings.kaidanzhushou
 
 import com.goings.kaidanzhushou.data.remote.KimiErrorKind
+import com.goings.kaidanzhushou.domain.AdvanceReturnType
 import com.goings.kaidanzhushou.domain.EditableFields
 import com.goings.kaidanzhushou.domain.RecognitionStatus
 import com.goings.kaidanzhushou.domain.RecognitionTransitions
@@ -25,6 +26,28 @@ class DomainTest {
         assertTrue(RecordValidator.validate(valid).isEmpty())
         val fields = valid.copy(destinationText = "", quantity = 0, freight = -1.0)
         assertEquals(setOf("destination_text", "quantity", "freight"), RecordValidator.validate(fields).map { it.field }.toSet())
+        // 总运费必填：每张单都有运费，只写运费时总运费就等于运费。
+        assertEquals("freight", RecordValidator.validate(valid.copy(freight = null)).single().field)
+    }
+
+    @Test fun advancePaymentRequiresAReturnTypeAndFitsInsideTheTotalFreight() {
+        // 没有垫付款时一切照旧，去向也就无从谈起。
+        assertTrue(RecordValidator.validate(valid).isEmpty())
+        // 0 与空是同一件事：归一后不触发任何校验。
+        val zeroed = valid.withAdvancePayment(0.0)
+        assertEquals(null, zeroed.advancePayment)
+        assertTrue(RecordValidator.validate(zeroed).isEmpty())
+        // 有垫付款却没选去向 → 拦住。
+        val unchosen = valid.copy(freight = 280.0).withAdvancePayment(250.0)
+        assertEquals(setOf("advance_return_type"), RecordValidator.validate(unchosen).map { it.field }.toSet())
+        AdvanceReturnType.entries.forEach {
+            assertTrue(RecordValidator.validate(unchosen.copy(advanceReturnType = it.code)).isEmpty())
+        }
+        // 总运费必须装得下垫付款。
+        val tooSmall = valid.copy(freight = 30.0).withAdvancePayment(250.0).copy(advanceReturnType = "cashreturn")
+        assertEquals(setOf("freight"), RecordValidator.validate(tooSmall).map { it.field }.toSet())
+        // 清空金额时去向一并被清掉，不留脏值。
+        assertEquals(null, unchosen.copy(advanceReturnType = "discount").withAdvancePayment(null).advanceReturnType)
     }
 
     @Test fun acceptsAllPaymentTypesAndRejectsMissingPayment() {

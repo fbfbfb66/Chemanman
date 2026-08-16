@@ -35,6 +35,7 @@ class ProfileLearningTest {
             repository.seedProfilesFromConfirmedRecords()
             repository.seedProfilesFromConfirmedRecords()
 
+            val senders = db.dao().getSenderProfiles()
             val receivers = db.dao().getReceiverProfiles()
             val goods = db.dao().getGoodsProfiles()
             assertEquals(1, receivers.size)
@@ -42,7 +43,11 @@ class ProfileLearningTest {
             assertEquals(20, receivers.single().lastUsedAt)
             assertEquals(1, goods.size)
             assertEquals(2, goods.single().useCount)
+            assertEquals(1, senders.size)
+            assertEquals(2, senders.single().useCount)
             assertEquals(db.dao().getRecord("one")?.receiverProfileId, db.dao().getRecord("two")?.receiverProfileId)
+            assertEquals(db.dao().getRecord("one")?.senderProfileId, db.dao().getRecord("two")?.senderProfileId)
+            assertNotNull(db.dao().getRecord("one")?.senderProfileId)
         } finally {
             db.close()
         }
@@ -115,7 +120,8 @@ class ProfileLearningTest {
             assertEquals("任运飞", fuzzy.receiverName)
             assertEquals("15085792192", fuzzy.receiverMobile)
             assertEquals(null, fuzzy.receiverProfileId)
-            assertEquals(setOf(AssociationFields.RECEIVER, AssociationFields.GOODS), fuzzy.uncertainFieldSet())
+            // 货物只做下拉辅助，模糊匹配也不再标记待确认；发货人这一版草稿没给名字，同样不标记。
+            assertEquals(setOf(AssociationFields.RECEIVER), fuzzy.uncertainFieldSet())
             assertEquals(RecognitionStatus.PARSED, fuzzy.recognitionStatus)
         } finally {
             db.close()
@@ -138,6 +144,7 @@ class ProfileLearningTest {
         goodsName = "硫酸铜",
         packageName = "25公斤/袋",
         quantity = 1,
+        freight = 30.0,
         paymentType = "pay_billing",
         updatedAt = updatedAt,
     )

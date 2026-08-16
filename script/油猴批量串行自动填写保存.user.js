@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         车满满批量串行自动填写保存
 // @namespace    codex.chemanman.batch-serial.production
-// @version      1.4.3
+// @version      1.6.0
 // @description  从本地 XLSX 严格逐条填写保存。兼容 Schema v1.1 的现付、到付和回付，串行保存逻辑保持不变。支持导出常用到站字典供手机 App 使用。
 // @author       User
 // @match        https://t800.chemanman.com/Order*
@@ -12,7 +12,7 @@
 (() => {
   "use strict";
 
-  const SCRIPT_VERSION = "1.4.3";
+  const SCRIPT_VERSION = "1.6.0";
   const CHECKPOINT_VERSION = 3;
   const MAX_ORDERS = 100;
   const SERIAL_CONCURRENCY = 1;
@@ -44,7 +44,10 @@
   const SAVE_BUTTON_TEXT = /^(保存(?:\(F9\))?|保存并打印|保存并关闭|提交运单|继续保存)$/i;
   const DIAGNOSTIC_SCHEMA_VERSION = 1;
   const DIAGNOSTIC_EVENT_LIMIT = 500;
-  const POST_SAVE_COOLDOWN_MS = 6000;
+  // 保存后创建门控（v1.5.0）：不再固定盲等，改为等页面自身的 oinfo 信号 + DOM 安静窗口；
+  // 超时放行作为兜底（不阻断批次），走哪条路径都会写诊断 post_save_ready。
+  const POST_SAVE_SIGNAL_TIMEOUT_MS = 10000;
+  const DOM_QUIET_WINDOW_MS = 500;
   // 慢网络超时配置（v1.2.0 放宽）：只推迟失败判定，成功路径在条件满足时立即返回。
   const SAVE_RESULT_TIMEOUT_MS = 60000;
   const SAVE_REQUEST_SEEN_TIMEOUT_MS = 10000;
@@ -67,8 +70,8 @@
     "delivery_type", "sender_name", "receiver_name", "receiver_mobile", "goods_name",
     "package", "quantity", "weight", "volume", "freight", "payment_type",
   ];
-  // v1.2 新增列：只在存在时读取，不参与表头必备校验——v1.1 旧表必须照常导入。
-  const OPTIONAL_HEADERS = ["destination_unique_key", "destination_display"];
+  // v1.2/v1.3 新增列：只在存在时读取，不参与表头必备校验——旧表必须照常导入。
+  const OPTIONAL_HEADERS = ["destination_unique_key", "destination_display", "cashreturn", "discount"];
   const DESTINATION_KEY_PATTERN = /^xzqh_(id_\d+|kw_.+)$/;
   const FIELD_MAPPINGS = [
     { key: "destination_text", dataPath: "arr", kind: "autocomplete", required: true },
@@ -83,6 +86,13 @@
     { key: "volume", dataPath: "volume_1", kind: "number", required: false },
     { key: "freight", dataPath: "co_freight_f", kind: "number", required: true },
     { key: "payment_type", dataPath: "pay_mode", kind: "choice", required: true, display: { pay_billing: "现付", pay_arrival: "到付", pay_receipt: "回付" } },
+  ];
+  // v1.3 垫付款：单据上的垫付金额按人工选定的去向落到现返或欠返，至多一个非空。
+  // 刻意不并入 FIELD_MAPPINGS——那是「必然存在」的闭集，被表单根判定与致命性检查依赖；
+  // 这两个框会随租户费用栏设置存在与否，只能按条件字段处理。
+  const CONDITIONAL_FIELDS = [
+    { key: "cashreturn", dataPath: "cashreturn", kind: "number" },
+    { key: "discount", dataPath: "discount", kind: "number" },
   ];
   const DIRECT_FIELDS = FIELD_MAPPINGS.filter((item) => item.kind === "text" || item.kind === "number");
   const CUSTOM_FIELDS = FIELD_MAPPINGS.filter((item) => item.kind === "autocomplete" || item.kind === "choice");
@@ -102,7 +112,8 @@
     tasks: [], parsedImport: null, importErrors: [], duplicateKeys: [], fileName: "", batchId: "",
     running: false, batchStarted: false, pauseRequested: false, stopRequested: false, globalHalt: "",
     authorization: false, safetyBlocks: 0, savePermit: null, clickPermitId: "", baselineTabs: new WeakSet(),
-    recovered: false, legacyCheckpoint: false, completed: false, reportExported: false, ui: null,
+    recovered: false, legacyCheckpoint: false, completed: false, ui: null,
+    postSaveOinfoSettledAt: 0, lastDomMutationAt: 0,
     diagnostics: { session_id: stableHash(`${Date.now()}-${Math.random()}`), started_at: now(), bridge_ready: false, events: [] },
   };
   let operationMutex = Promise.resolve();
@@ -111,8 +122,32 @@
 
   installPageNetworkObserver();
   installSafetyGuards();
+  installDomQuietTracker();
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", initializeUi, { once: true });
   else initializeUi();
+
+  // 保存后创建门控的 DOM 安静追踪：常驻观察页面结构变更，只更新时间戳，不做其他事。
+  // 面板自身的变更必须排除，否则脚本的状态渲染会永远打断"安静"判定。
+  function installDomQuietTracker() {
+    if (typeof MutationObserver !== "function") return;
+    const attach = () => {
+      if (!document.documentElement) return false;
+      new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+          if (mutation.target instanceof Element && mutation.target.closest?.(`#${PANEL_ID}`)) continue;
+          state.lastDomMutationAt = Date.now();
+          break;
+        }
+      }).observe(document.documentElement, { childList: true, subtree: true });
+      return true;
+    };
+    if (attach()) return;
+    const waiter = new MutationObserver(() => {
+      if (!attach()) return;
+      waiter.disconnect();
+    });
+    waiter.observe(document, { childList: true, subtree: true });
+  }
 
   function installPageNetworkObserver() {
     window.addEventListener?.(BRIDGE_EVENT, handlePageObserverEvent);
@@ -141,6 +176,8 @@
     if (window[marker]?.addChannel) { window[marker].addChannel(eventName); return; }
     const channels = new Set([eventName]);
     const match = (value) => /\/api\/Order\/Order\/coHandle(?:\/|\?|$)/i.test(String(value || ""));
+    // 保存后创建门控信号：保存成功后页面自身会拉取已存运单信息，响应落定即"保存后流程已执行"。
+    const matchOinfo = (value) => /\/api\/Order\/Order\/oinfo(?:\/|\?|$)/i.test(String(value || ""));
     const hash = (value) => { let output = 2166136261; for (const char of String(value)) { output ^= char.charCodeAt(0); output = Math.imul(output, 16777619); } return `fnv1a-${(output >>> 0).toString(16).padStart(8, "0")}`; };
     const emit = (type, detail = {}) => {
       for (const channel of channels) window.dispatchEvent(new CustomEvent(channel, { detail: { type, ...detail } }));
@@ -187,9 +224,12 @@
       if (typeof original !== "function" || original.__cmPageObserved) continue;
       const observed = function observedResponseBody(...args) {
         const response = this; const result = original.apply(response, args);
-        if (!match(response?.url)) return result;
+        const url = response?.url;
+        if (!match(url) && !matchOinfo(url)) return result;
+        // coHandle 永不命中 oinfo 匹配，保存事件保持原样不带 signal 字段。
+        const signal = matchOinfo(url) ? { signal: "oinfo" } : {};
         return Promise.resolve(result).then((value) => {
-          emit("response_body", describe(response.status, value, `response.${method}`, response.url, response.headers?.get?.("content-type") || ""));
+          emit("response_body", { ...signal, ...describe(response.status, value, `response.${method}`, response.url, response.headers?.get?.("content-type") || "") });
           return value;
         }, (error) => { emit("body_read_error", { source: `response.${method}`, status: response?.status || 0, error: String(error?.message || error).slice(0, 240) }); throw error; });
       };
@@ -201,11 +241,14 @@
       const originalOpen = xhrPrototype.open; const originalSend = xhrPrototype.send;
       xhrPrototype.open = function observedOpen(method, url, ...rest) { this.__cmPageSaveUrl = String(url || ""); return originalOpen.call(this, method, url, ...rest); };
       xhrPrototype.send = function observedSend(body) {
-        if (!match(this.__cmPageSaveUrl)) return originalSend.call(this, body);
-        const id = requestId(); emit("request", { request_id: id, transport: "page-xhr", path: (() => { try { return new URL(this.__cmPageSaveUrl, location.href).pathname; } catch { return ""; } })() });
+        const isSave = match(this.__cmPageSaveUrl); const isOinfo = !isSave && matchOinfo(this.__cmPageSaveUrl);
+        if (!isSave && !isOinfo) return originalSend.call(this, body);
+        const id = requestId();
+        // oinfo 不发 request 事件：只取响应落定时刻，避免误入保存许可归因。
+        if (isSave) emit("request", { request_id: id, transport: "page-xhr", path: (() => { try { return new URL(this.__cmPageSaveUrl, location.href).pathname; } catch { return ""; } })() });
         this.addEventListener("loadend", () => {
           let value = ""; try { value = typeof this.responseText === "string" ? this.responseText : ""; } catch { /* metadata only */ }
-          emit("response_body", { request_id: id, transport: "page-xhr", ...describe(this.status, value, "xhr.loadend", this.responseURL || this.__cmPageSaveUrl, this.getResponseHeader?.("content-type") || "") });
+          emit("response_body", { request_id: id, transport: "page-xhr", ...(isOinfo ? { signal: "oinfo" } : {}), ...describe(this.status, value, "xhr.loadend", this.responseURL || this.__cmPageSaveUrl, this.getResponseHeader?.("content-type") || "") });
         }, { once: true });
         return originalSend.call(this, body);
       };
@@ -221,6 +264,14 @@
     if (detail.type === "ready") state.diagnostics.bridge_ready = true;
     const permit = state.savePermit;
     recordDiagnostic(`page_${detail.type || "unknown"}`, detail, permit?.taskId || "");
+    // oinfo 信号与保存许可无关：只记录落定时刻供创建门控使用，绝不进入 permit 归因。
+    if (detail.signal === "oinfo") {
+      if (detail.type === "response_body" && Number(detail.errno) === 0) {
+        state.postSaveOinfoSettledAt = Date.now();
+        recordDiagnostic("post_save_oinfo_settled", { channel: detail.source || detail.transport || "", http_status: Number(detail.status) || "" });
+      }
+      return;
+    }
     if (!permit || permit.status === "settled") return;
     if (detail.type === "request") {
       permit.bridgeRequestId = detail.request_id || permit.bridgeRequestId || "";
@@ -914,7 +965,7 @@
       if (row.__formulaFields?.length) errors.push(`${label}：不允许公式单元格（${row.__formulaFields.join("、")}）`);
       for (const key of [...REQUIRED_HEADERS, ...OPTIONAL_HEADERS]) if (typeof order[key] === "string" && /^(null|undefined)$/i.test(order[key].trim())) errors.push(`${label} ${key}：不得用 ${order[key]} 表示空值`);
       const schemaVersion = String(order.schema_version || "").trim();
-      if (!["v1.0", "v1.1", "v1.2"].includes(schemaVersion)) errors.push(`${label} schema_version：必须为 v1.0、v1.1 或 v1.2`);
+      if (!["v1.0", "v1.1", "v1.2", "v1.3"].includes(schemaVersion)) errors.push(`${label} schema_version：必须为 v1.0、v1.1、v1.2 或 v1.3`);
       const id = String(order.source_record_id || "").trim(); const batchId = String(order.batch_id || "").trim();
       if (!id) errors.push(`${label} source_record_id：不能为空`);
       if (seen.has(id)) errors.push(`${label} source_record_id：${id} 重复`); seen.add(id);
@@ -929,6 +980,16 @@
         if (isBlank(order[key])) order[key] = ""; else { const value = toNumber(order[key]); if (!Number.isFinite(value) || value < 0) errors.push(`${label} ${key}：必须为空或非负数`); order[key] = value; }
       }
       const freight = toNumber(order.freight); if (!Number.isFinite(freight) || freight < 0 || !hasAtMostTwoDecimals(freight)) errors.push(`${label} freight：必须为非负数且最多两位小数`); order.freight = freight;
+      // v1.3 垫付款：freight 是总运费（运费 + 垫付款），垫付款按人工选定的去向落到现返或欠返其一。
+      for (const key of ["cashreturn", "discount"]) {
+        if (isBlank(order[key])) { order[key] = ""; continue; }
+        if (schemaVersion !== "v1.3") { errors.push(`${label} ${key}：Schema ${schemaVersion} 不支持垫付款列`); order[key] = ""; continue; }
+        const value = toNumber(order[key]);
+        if (!Number.isFinite(value) || value <= 0 || !hasAtMostTwoDecimals(value)) errors.push(`${label} ${key}：必须为空或大于 0 且最多两位小数`);
+        else if (Number.isFinite(freight) && freight < value) errors.push(`${label} ${key}：总运费 ${freight} 不能小于垫付款 ${value}`);
+        order[key] = value;
+      }
+      if (!isBlank(order.cashreturn) && !isBlank(order.discount)) errors.push(`${label}：现返与欠返只能填一个`);
       order.receiver_mobile = isBlank(order.receiver_mobile) ? "" : String(order.receiver_mobile).trim();
       order.package = isBlank(order.package) ? "" : String(order.package).trim();
       order.destination_unique_key = isBlank(order.destination_unique_key) ? "" : String(order.destination_unique_key).trim();
@@ -1030,7 +1091,8 @@
       });
       const fatalField = task.fields.find((field) => field.fatal);
       if (fatalField) throw fatalError(fatalField.error);
-      if (!task.fields.every((field) => field.status === "verified")) throw new Error("12 个字段未全部通过回读");
+      // skipped 是「这一单没有垫付款」的正常结果，不算漏填。
+      if (!task.fields.every((field) => field.status === "verified" || field.status === "skipped")) throw new Error("必填字段未全部通过回读");
       transitionTask(task, "ready_to_save");
       if (state.pauseRequested || state.stopRequested) return transitionTask(task, "manual_pending", "批次在保存前被暂停或停止");
       await saveSingleTask(task);
@@ -1067,7 +1129,7 @@
       transitionTask(task, "direct_filling");
       return;
     }
-    await waitForPostSaveCooldown(task);
+    await waitForPostSaveReady(task);
     transitionTask(task, "waiting_create_entry", "等待网站保存后页面稳定和创建入口就绪");
     const beforeTabs = new Set(listTabElements()); const previous = getActiveTab();
     const action = await waitForStableCreateOrderAction(CREATE_ENTRY_TIMEOUT_MS, 500);
@@ -1098,12 +1160,28 @@
     transitionTask(task, "direct_filling");
   }
 
-  async function waitForPostSaveCooldown(task) {
+  // 保存后创建门控：等页面自身的 oinfo 信号（errno=0，证明保存后流程已执行）且 DOM 连续
+  // DOM_QUIET_WINDOW_MS 无结构变更（证明其引发的异步刷新已完成），二者齐备即放行。
+  // 快网实测约 3s 放行；慢网自动顺延，最长 POST_SAVE_SIGNAL_TIMEOUT_MS，超时放行并写诊断。
+  async function waitForPostSaveReady(task) {
     const previous = [...state.tasks].filter((item) => item.index < task.index && item.state === "saved").sort((a, b) => b.index - a.index)[0];
-    if (!previous?.saveSettledAt) return;
-    const elapsed = Date.now() - Date.parse(previous.saveSettledAt); const remaining = Math.max(0, POST_SAVE_COOLDOWN_MS - (Number.isFinite(elapsed) ? elapsed : 0));
-    recordDiagnostic("post_save_cooldown", { previous_record_id: previous.order.source_record_id, configured_ms: POST_SAVE_COOLDOWN_MS, elapsed_ms: Math.max(0, elapsed || 0), remaining_ms: remaining }, task.id);
-    if (remaining) await sleep(remaining);
+    const saveSettledMs = Date.parse(previous?.saveSettledAt || "");
+    if (!previous || !Number.isFinite(saveSettledMs)) return;
+    const startedMs = Date.now();
+    const deadline = startedMs + POST_SAVE_SIGNAL_TIMEOUT_MS;
+    while (true) {
+      const oinfoSeen = state.postSaveOinfoSettledAt > saveSettledMs;
+      const quietSeen = state.lastDomMutationAt > 0 && Date.now() - state.lastDomMutationAt >= DOM_QUIET_WINDOW_MS;
+      if (oinfoSeen && quietSeen) {
+        recordDiagnostic("post_save_ready", { path: "signal", previous_record_id: previous.order.source_record_id, waited_ms: Date.now() - startedMs, since_save_settled_ms: Date.now() - saveSettledMs }, task.id);
+        return;
+      }
+      if (Date.now() >= deadline) {
+        recordDiagnostic("post_save_ready", { path: "timeout_fallback", oinfo_seen: oinfoSeen, quiet_seen: quietSeen, previous_record_id: previous.order.source_record_id, waited_ms: Date.now() - startedMs }, task.id);
+        return;
+      }
+      await sleep(100);
+    }
   }
 
   function bindTaskToForm(task, tab, root, origin) {
@@ -1323,10 +1401,23 @@
         if (!matches) throw new Error("写入后回读不一致"); result.status = "verified";
       } catch (error) { result.status = "failed"; result.error = errorMessage(error); if (error?.fatal) result.fatal = true; }
     }
+    // 垫付款字段：没值就整个跳过，绝不触碰页面；有值而页面没这个框，只让这一单转人工，不停批。
+    for (const mapping of CONDITIONAL_FIELDS) {
+      const result = fieldResult(mapping); fields.push(result);
+      const expected = task.order[mapping.key];
+      if (isBlank(expected)) { result.status = "skipped"; continue; }
+      try {
+        const control = optionalControlInTask(task, mapping.dataPath);
+        if (!control) throw new Error(`页面上没有${FIELD_LABEL[mapping.key] || mapping.key}输入框，请确认网站费用信息栏设置`);
+        await writeControl(control, expected, { focus: false, blur: false });
+        if (Number(readControl(optionalControlInTask(task, mapping.dataPath))) !== Number(expected)) throw new Error("写入后回读不一致");
+        result.status = "verified";
+      } catch (error) { result.status = "failed"; result.error = errorMessage(error); if (error?.fatal) result.fatal = true; }
+    }
     task.fields = mergeFields(task.fields, fields);
     const fatal = fields.find((item) => item.fatal);
     if (fatal) { failTask(task, fatalError(fatal.error)); state.globalHalt = fatal.error; return; }
-    if (fields.some((item) => item.status !== "verified")) { failTask(task, new Error("普通字段未全部写入并通过回读")); return; }
+    if (fields.some((item) => item.status !== "verified" && item.status !== "skipped")) { failTask(task, new Error("普通字段未全部写入并通过回读")); return; }
     transitionTask(task, "custom_pending");
   }
 
@@ -1335,14 +1426,22 @@
     transitionTask(task, "custom_filling"); const fields = [];
     for (const mapping of CUSTOM_FIELDS) {
       const result = fieldResult(mapping); fields.push(result);
+      let control = null;
       try {
-        const control = uniqueControlInTask(task, mapping.dataPath); const expected = mapping.display ? mapping.display[task.order[mapping.key]] : task.order[mapping.key];
+        control = uniqueControlInTask(task, mapping.dataPath); const expected = mapping.display ? mapping.display[task.order[mapping.key]] : task.order[mapping.key];
         if (mapping.kind === "autocomplete") await fillScopedAutocomplete(control, String(expected), task);
         else await chooseScopedValue(control, String(expected), task);
         if (control.getAttribute("data-is-select") !== "1") throw new Error("网站未确认下拉选择");
         if (!normalizeText(readControl(control) || control.title).includes(normalizeText(expected))) throw new Error("选择后回读不一致");
         result.status = "verified";
-      } catch (error) { result.status = "failed"; result.error = errorMessage(error); result.fatal = Boolean(error?.fatal); break; }
+      } catch (error) {
+        result.status = "failed"; result.error = errorMessage(error); result.fatal = Boolean(error?.fatal);
+        // 单个字段阻塞不拖垮整单：非致命错误收掉残留下拉后继续填后面的字段，
+        // 批次暂停和整单回读门禁在循环外照常生效，用户手工修单时只需补失败的那个字段。
+        if (result.fatal) break;
+        try { control?.blur(); } catch { /* 控件可能已不可用，忽略 */ }
+        await sleep(180);
+      }
     }
     task.fields = mergeFields(task.fields, fields);
     const failure = fields.find((item) => item.status !== "verified");
@@ -1600,6 +1699,17 @@
   }
 
   function verifyCompleteOrder(task) {
+    const conditional = CONDITIONAL_FIELDS.map((mapping) => {
+      const result = fieldResult(mapping); const expected = task.order[mapping.key];
+      if (isBlank(expected)) { result.status = "skipped"; return result; }
+      try {
+        const control = optionalControlInTask(task, mapping.dataPath);
+        if (!control) throw new Error(`页面上没有${FIELD_LABEL[mapping.key] || mapping.key}输入框`);
+        result.status = Number(readControl(control)) === Number(expected) ? "verified" : "failed";
+        if (result.status === "failed") result.error = "回读不一致";
+      } catch (error) { result.status = "failed"; result.error = errorMessage(error); result.fatal = Boolean(error?.fatal); }
+      return result;
+    });
     return FIELD_MAPPINGS.map((mapping) => {
       const result = fieldResult(mapping); const expected = mapping.display ? mapping.display[task.order[mapping.key]] : task.order[mapping.key];
       try {
@@ -1611,7 +1721,7 @@
         if (result.status === "failed") result.error = "回读或下拉确认不一致";
       } catch (error) { result.status = "failed"; result.error = errorMessage(error); result.fatal = Boolean(error?.fatal); }
       return result;
-    });
+    }).concat(conditional);
   }
 
   async function saveSingleTask(task, options = {}) {
@@ -1709,7 +1819,7 @@
     task.errorCode = "";
     await withOperationLock(async () => {
       await switchToTask(task); task.fields = verifyCompleteOrder(task);
-      if (!task.fields.every((field) => field.status === "verified")) throw new Error("人工修正后仍未通过全部 12 字段回读");
+      if (!task.fields.every((field) => field.status === "verified" || field.status === "skipped")) throw new Error("人工修正后仍未通过全部必填字段回读");
       transitionTask(task, "ready_to_save");
     });
     await saveSingleTask(task, { manual: true, reason: "repair_after_manual" });
@@ -1865,7 +1975,6 @@
     if (!pending) {
       state.completed = true; state.running = false; localStorage.removeItem(CHECKPOINT_KEY);
       setStatus(`批次完成：保存 ${state.tasks.filter((task) => task.state === "saved").length} 条，放弃 ${state.tasks.filter((task) => task.state === "abandoned").length} 条。`);
-      if (!state.reportExported) { state.reportExported = true; exportReportCsv(); }
     } else if (!state.tasks.some((task) => task.state === "pending") && !state.running) {
       setStatus(`自动队列已结束，仍有 ${state.tasks.filter((task) => MANUAL_STATES.has(task.state)).length} 条需要人工收尾。`, "warning");
     } else if (state.pauseRequested) setStatus("批次已暂停，可处理人工项或继续。", "warning");
@@ -1995,7 +2104,7 @@
       tasks: [], parsedImport: null, importErrors: [], duplicateKeys: [], fileName: "", batchId: "",
       running: false, batchStarted: false, pauseRequested: false, stopRequested: false, globalHalt: "",
       authorization: false, safetyBlocks: 0, savePermit: null, clickPermitId: "", baselineTabs: new WeakSet(),
-      recovered: false, legacyCheckpoint: false, completed: false, reportExported: false,
+      recovered: false, legacyCheckpoint: false, completed: false,
       diagnostics: { session_id: stableHash(`${Date.now()}-${Math.random()}`), started_at: now(), bridge_ready: state.diagnostics.bridge_ready, events: [] },
     });
     state.ui.file.value = ""; state.ui.authorize.checked = false; setStatus("请选择 Excel。"); renderSummary();
@@ -2066,6 +2175,18 @@
       if (!verified) throw new Error(`页面重挂载后 ${mapping.key} 重新写入仍不一致`);
       corrected += 1;
     }
+    for (const mapping of CONDITIONAL_FIELDS) {
+      const expected = task.order[mapping.key];
+      if (isBlank(expected)) continue;
+      const control = optionalControlInTask(task, mapping.dataPath);
+      if (!control) throw new Error(`页面重挂载后找不到 ${mapping.key} 输入框`);
+      if (Number(readControl(control)) === Number(expected)) continue;
+      await writeControl(control, expected, { focus: false, blur: false });
+      if (Number(readControl(optionalControlInTask(task, mapping.dataPath))) !== Number(expected)) {
+        throw new Error(`页面重挂载后 ${mapping.key} 重新写入仍不一致`);
+      }
+      corrected += 1;
+    }
     recordDiagnostic("direct_fields_reconciled_after_rebind", { corrected_fields: corrected }, task.id);
   }
 
@@ -2085,6 +2206,14 @@
     const matches = [...task.root.querySelectorAll(`[data-path="${CSS.escape(dataPath)}"]`)].filter((item) => item.isConnected);
     if (matches.length !== 1) throw fatalError(`任务表单内 data-path=${dataPath} 数量为 ${matches.length}`);
     return matches[0];
+  }
+
+  // 条件字段专用：控件不存在时返回 null 交给调用方判断，不像 uniqueControlInTask 那样直接停批。
+  function optionalControlInTask(task, dataPath) {
+    if (!task.root?.isConnected) throw fatalError("任务表单根容器已断开");
+    const matches = [...task.root.querySelectorAll(`[data-path="${CSS.escape(dataPath)}"]`)].filter((item) => item.isConnected);
+    if (matches.length > 1) throw fatalError(`任务表单内 data-path=${dataPath} 数量为 ${matches.length}`);
+    return matches[0] || null;
   }
 
   function listTabElements() {
@@ -2155,7 +2284,8 @@
   }
 
   function fieldResult(mapping) { return { key: mapping.key, data_path: mapping.dataPath, status: "pending", error: "" }; }
-  function mergeFields(existing, incoming) { const map = new Map(existing.map((item) => [item.key, item])); for (const item of incoming) map.set(item.key, item); return FIELD_MAPPINGS.map((item) => map.get(item.key)).filter(Boolean); }
+  // 投影顺序含条件字段，否则现返/欠返的填写结果会在合并时被静默丢掉。
+  function mergeFields(existing, incoming) { const map = new Map(existing.map((item) => [item.key, item])); for (const item of incoming) map.set(item.key, item); return [...FIELD_MAPPINGS, ...CONDITIONAL_FIELDS].map((item) => map.get(item.key)).filter(Boolean); }
   function fatalError(message) { const error = new Error(message); error.fatal = true; return error; }
 
   async function parseXlsxArrayBuffer(arrayBuffer, preferredSheetName) {
@@ -2317,8 +2447,9 @@
     schema_version: "表格版本", batch_id: "批次号", source_record_id: "订单编号", source_label: "订单备注",
     destination_text: "到站", delivery_type: "送货方式", sender_name: "发货人", receiver_name: "收货人",
     receiver_mobile: "收货人电话", goods_name: "货物名称", package: "包装", quantity: "件数",
-    weight: "重量", volume: "体积", freight: "运费", payment_type: "付款方式",
+    weight: "重量", volume: "体积", freight: "总运费", payment_type: "付款方式",
     destination_unique_key: "到站编码", destination_display: "到站全称",
+    cashreturn: "现返", discount: "欠返",
   };
 
   const STAGE_TEXT = {
@@ -2416,7 +2547,7 @@
 
   // 状态栏文案。原文保留在 #statusRaw 里，调试模式下可见。
   const STATUS_RULES = [
-    [/^批次完成：保存 (\d+) 条，放弃 (\d+) 条/, "全部完成：成功 $1 条，放弃 $2 条。报告已经自动下载。"],
+    [/^批次完成：保存 (\d+) 条，放弃 (\d+) 条/, "全部完成：成功 $1 条，放弃 $2 条。需要报告的话点「导出报告」。"],
     [/^预检通过：(\d+) 条订单/, "表格没问题，一共 $1 条订单，可以开始了。"],
     [/^导入被阻断：发现 (\d+) 个问题/, "这份表格有 $1 处需要先改一下。"],
     [/^Excel 解析失败/, "这个文件打不开。请确认是 .xlsx，而且没有加密或损坏。"],
@@ -2532,9 +2663,9 @@
     if (stage === "running" && manualTask) {
       const [title, hint] = taskTrouble(manualTask);
       // 对不上的项目要带上「应为什么」，否则用户不知道要改成什么样——期望值就是表格里的值（枚举走显示名）。
-      const missing = manualTask.fields.filter((field) => field.status !== "verified").map((field) => {
+      const missing = manualTask.fields.filter((field) => field.status !== "verified" && field.status !== "skipped").map((field) => {
         const label = FIELD_LABEL[field.key] || field.key;
-        const mapping = FIELD_MAPPINGS.find((item) => item.key === field.key);
+        const mapping = [...FIELD_MAPPINGS, ...CONDITIONAL_FIELDS].find((item) => item.key === field.key);
         const expected = mapping ? (mapping.display ? mapping.display[manualTask.order[mapping.key]] : manualTask.order[mapping.key]) : "";
         return isBlank(expected) ? label : `${label}（应为：${expected}）`;
       });
@@ -2550,7 +2681,7 @@
     }
     if (stage === "done") {
       el.doneTitle.textContent = counts.abandoned ? `做完了：成功 ${counts.saved} 条，放弃 ${counts.abandoned} 条` : `全部完成：成功 ${counts.saved} 条`;
-      el.doneText.textContent = "报告已经自动下载到你的下载文件夹。可以点「新建一批」处理下一份表格。";
+      el.doneText.textContent = "需要留底的话点「导出报告」下载。可以点「新建一批」处理下一份表格。";
       if (!panel.doneShown) { panel.doneShown = true; setWindowOpen(true); }
     }
     if (!state.completed) panel.doneShown = false;
@@ -2722,7 +2853,8 @@
 
   window.__CMBatchSerial = Object.freeze({
     version: SCRIPT_VERSION, maxOrders: MAX_ORDERS, concurrency: SERIAL_CONCURRENCY, parallelism: SERIAL_CONCURRENCY,
-    requiredHeaders: [...REQUIRED_HEADERS], fieldMappings: FIELD_MAPPINGS,
+    requiredHeaders: [...REQUIRED_HEADERS], optionalHeaders: [...OPTIONAL_HEADERS],
+    fieldMappings: FIELD_MAPPINGS, conditionalFields: CONDITIONAL_FIELDS,
     parseXlsxArrayBuffer, validateOrders, classifySaveResponse, extractOrderIdentity, sanitizeForReport, ledgerKey,
     readOrderNumber, normalizeOrderNumber, isOrderNumberAdvanced, orderNumberSuffix, locateCreateOrderAction,
     nextPendingTask, unlockDuplicates, pauseBatch, stopBatch, switchToTask, buildDiagnosticReport, state,
